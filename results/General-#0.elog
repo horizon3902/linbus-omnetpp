@@ -1,0 +1,115 @@
+SB ov 1536 ev 2 rid General-0-20251112-17:03:05-139563
+
+E # 0 t 0 m 1 ce -1 msg -1
+MC id 1 c omnetpp::cModule t LinNetwork n LinNetwork cm 1
+MDC id 1 d ""
+MC id 2 c omnetpp::cModule t LinBus pid 1 n bus cm 1
+MDC id 2 d i=block/network
+GC m 2 g 1048576 n gate$i i 0 o 0
+GC m 2 g 1572864 n gate$o i 0 o 1
+GC m 2 g 1048577 n gate$i i 1 o 0
+GC m 2 g 1572865 n gate$o i 1 o 1
+GC m 2 g 1048578 n gate$i i 2 o 0
+GC m 2 g 1572866 n gate$o i 2 o 1
+MC id 3 c LinNode t LinNode pid 1 n master
+GC m 3 g 0 n gate$i o 0
+GC m 3 g 1 n gate$o o 1
+MDC id 3 d p=100,200
+MC id 4 c LinNode t LinNode pid 1 n slave1
+GC m 4 g 0 n gate$i o 0
+GC m 4 g 1 n gate$o o 1
+MDC id 4 d p=200,200
+MC id 5 c LinNode t LinNode pid 1 n slave2
+GC m 5 g 0 n gate$i o 0
+GC m 5 g 1 n gate$o o 1
+MDC id 5 d p=300,200
+CC sm 3 sg 1 dm 2 dg 1048576
+CC sm 2 sg 1572864 dm 3 dg 0
+CC sm 4 sg 1 dm 2 dg 1048577
+CC sm 2 sg 1572865 dm 4 dg 0
+CC sm 5 sg 1 dm 2 dg 1048578
+CC sm 2 sg 1572866 dm 5 dg 0
+MC id 6 c LinBusLogic t LinBusLogic pid 2 n logic
+MDC id 6 d p=100,100
+GC m 6 g 1048576 n gate$i i 0 o 0
+GC m 6 g 1572864 n gate$o i 0 o 1
+CC sm 2 sg 1048576 dm 6 dg 1048576
+CC sm 6 sg 1572864 dm 2 dg 1572864
+GC m 6 g 1048577 n gate$i i 1 o 0
+GC m 6 g 1572865 n gate$o i 1 o 1
+CC sm 2 sg 1048577 dm 6 dg 1048577
+CC sm 6 sg 1572865 dm 2 dg 1572865
+GC m 6 g 1048578 n gate$i i 2 o 0
+GC m 6 g 1572866 n gate$o i 2 o 1
+CC sm 2 sg 1048578 dm 6 dg 1048578
+CC sm 6 sg 1572866 dm 2 dg 1572866
+CMB sm 1 tm 2 m initialize(0)
+CME
+CMB sm 1 tm 6 m initialize(0)
+- INFO: LIN bus initialized
+CME
+CMB sm 1 tm 3 m initialize(0)
+CM id 62 tid 62 eid 62 etid 62 c omnetpp::cMessage n sendTimer pe -1
+BS id 62 tid 62 eid 62 etid 62 c omnetpp::cMessage n sendTimer sm 3 st 0 am 3 at 0.01 pe 0
+ES id 62 tid 62 eid 62 etid 62 c omnetpp::cMessage n sendTimer sm 3 st 0 am 3 at 0.01 pe 0
+CME
+CMB sm 1 tm 4 m initialize(0)
+CM id 63 tid 63 eid 63 etid 63 c omnetpp::cMessage n sendTimer pe -1
+CME
+CMB sm 1 tm 5 m initialize(0)
+CM id 64 tid 64 eid 64 etid 64 c omnetpp::cMessage n sendTimer pe -1
+CME
+
+E # 1 t 0.01 m 3 ce 0 msg 62
+CM id 65 tid 65 eid 65 etid 65 c omnetpp::cMessage n LIN_Frame pe -1
+BS id 65 tid 65 eid 65 etid 65 c LinDataFrame n LIN_Frame m 3 pe 1
+SH sm 3 sg 1
+SH sm 2 sg 1048576
+ES id 65 tid 65 eid 65 etid 65 c LinDataFrame n LIN_Frame sm 3 sg 1 st 0.01 am 6 ag 1048576 at 0.01 pe 1
+CL id 66 tid 65 eid 66 etid 65 c omnetpp::cMessage n LIN_Frame m 3 pe -1 cid 65
+BS id 62 tid 62 eid 62 etid 62 c omnetpp::cMessage n sendTimer sm 3 st 0.01 am 3 at 0.02 pe 1
+ES id 62 tid 62 eid 62 etid 62 c omnetpp::cMessage n sendTimer sm 3 st 0.01 am 3 at 0.02 pe 1
+
+E # 2 t 0.01 m 6 ce 1 msg 65
+- INFO: Bus forwarding frame ID 18
+CL id 66 tid 65 eid 66 etid 65 c omnetpp::cMessage n LIN_Frame m 6 pe -1 cid 65
+BS id 66 tid 65 eid 66 etid 65 c LinDataFrame n LIN_Frame m 6 pe 2
+SH sm 6 sg 1572864
+SH sm 2 sg 1572864
+ES id 66 tid 65 eid 66 etid 65 c LinDataFrame n LIN_Frame sm 6 sg 1572864 st 0.01 am 3 ag 0 at 0.01 pe 2
+CL id 67 tid 65 eid 67 etid 65 c omnetpp::cMessage n LIN_Frame m 6 pe -1 cid 66
+CL id 67 tid 65 eid 67 etid 65 c omnetpp::cMessage n LIN_Frame m 6 pe -1 cid 65
+BS id 67 tid 65 eid 67 etid 65 c LinDataFrame n LIN_Frame m 6 pe 2
+SH sm 6 sg 1572865
+SH sm 2 sg 1572865
+ES id 67 tid 65 eid 67 etid 65 c LinDataFrame n LIN_Frame sm 6 sg 1572865 st 0.01 am 4 ag 0 at 0.01 pe 2
+CL id 68 tid 65 eid 68 etid 65 c omnetpp::cMessage n LIN_Frame m 6 pe -1 cid 67
+CL id 68 tid 65 eid 68 etid 65 c omnetpp::cMessage n LIN_Frame m 6 pe -1 cid 65
+BS id 68 tid 65 eid 68 etid 65 c LinDataFrame n LIN_Frame m 6 pe 2
+SH sm 6 sg 1572866
+SH sm 2 sg 1572866
+ES id 68 tid 65 eid 68 etid 65 c LinDataFrame n LIN_Frame sm 6 sg 1572866 st 0.01 am 5 ag 0 at 0.01 pe 2
+CL id 69 tid 65 eid 69 etid 65 c omnetpp::cMessage n LIN_Frame m 6 pe -1 cid 68
+DM id 65 tid 65 eid 65 etid 65 c omnetpp::cMessage n LIN_Frame m 6 pe 2
+
+E # 3 t 0.01 m 3 ce 2 msg 66
+- INFO: LinNetwork.master received frame ID=18
+DM id 66 tid 65 eid 66 etid 65 c omnetpp::cMessage n LIN_Frame m 3 pe 3
+
+E # 4 t 0.01 m 4 ce 2 msg 67
+- INFO: LinNetwork.slave1 received frame ID=18
+DM id 67 tid 65 eid 67 etid 65 c omnetpp::cMessage n LIN_Frame m 4 pe 4
+
+E # 5 t 0.01 m 5 ce 2 msg 68
+- INFO: LinNetwork.slave2 received frame ID=18
+DM id 68 tid 65 eid 68 etid 65 c omnetpp::cMessage n LIN_Frame m 5 pe 5
+
+E # 6 t 0.02 m 3 ce 1 msg 62
+CM id 69 tid 69 eid 69 etid 69 c omnetpp::cMessage n LIN_Frame pe -1
+BS id 69 tid 69 eid 69 etid 69 c LinDataFrame n LIN_Frame m 3 pe 6
+SH sm 3 sg 1
+SH sm 2 sg 1048576
+ES id 69 tid 69 eid 69 etid 69 c LinDataFrame n LIN_Frame sm 3 sg 1 st 0.02 am 6 ag 1048576 at 0.02 pe 6
+CL id 70 tid 69 eid 70 etid 69 c omnetpp::cMessage n LIN_Frame m 3 pe -1 cid 69
+BS id 62 tid 62 eid 62 etid 62 c omnetpp::cMessage n sendTimer sm 3 st 0.02 am 3 at 0.03 pe 6
+ES id 62 tid 62 eid 62 etid 62 c omnetpp::cMessage n sendTimer sm 3 st 0.02 am 3 at 0.03 pe 6
