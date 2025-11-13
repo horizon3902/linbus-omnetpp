@@ -87,6 +87,16 @@ void LinNode::handleMessage(cMessage *msg) {
             unsigned char sum = computeChecksum(response);
             response->setChecksum(sum);
 
+            // NOW we log the checksum HERE inside module context
+            EV_INFO << "[Checksum] PID=0x" << std::hex << (int)response->getPid()
+                    << " length=" << std::dec << response->getDataLength()
+                    << " checksum=0x" << std::hex << (int)sum
+                    << " (" << (response->getPid() == 0x3C || response->getPid() == 0x3D
+                                  ? "classic"
+                                  : "enhanced")
+                    << ")\n";
+
+
 
             // compute response transmission time: (data bytes + checksum) * 10 bits per byte (start/stop/parity/bit framing)
             int dataBytes = response->getDataLength();
@@ -112,6 +122,16 @@ void LinNode::handleMessage(cMessage *msg) {
             // Correct checksum
             unsigned char sum = computeChecksum(response);
             response->setChecksum(sum);
+
+            // NOW we log the checksum HERE inside module context
+            EV_INFO << "[Checksum] PID=0x" << std::hex << (int)response->getPid()
+                    << " length=" << std::dec << response->getDataLength()
+                    << " checksum=0x" << std::hex << (int)sum
+                    << " (" << (response->getPid() == 0x3C || response->getPid() == 0x3D
+                                  ? "classic"
+                                  : "enhanced")
+                    << ")\n";
+
 
 
             // compute response transmission time: (data bytes + checksum) * 10 bits per byte (start/stop/parity/bit framing)

@@ -3,10 +3,9 @@
 
 #include "LinDataFrame_m.h"
 
-// Computes PID using LIN parity
 unsigned char computePID(int frameId);
 
-// Computes classic checksum (sum over data bytes)
+// returns checksum only, no logging here
 unsigned char computeChecksum(LinDataFrame *frame);
 
 #endif
