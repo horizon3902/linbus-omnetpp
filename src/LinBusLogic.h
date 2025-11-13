@@ -1,18 +1,3 @@
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-// 
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Lesser General Public License for more details.
-// 
-// You should have received a copy of the GNU Lesser General Public License
-// along with this program.  If not, see http://www.gnu.org/licenses/.
-// 
-
 #ifndef LINBUSLOGIC_H_
 #define LINBUSLOGIC_H_
 
@@ -27,12 +12,20 @@ class LinBusLogic : public cSimpleModule {
     };
 
     std::vector<LinSlot> scheduleTable;
-    int currentSlotIndex = 0;
-    cMessage *slotTimer = nullptr;
+
+    // === Step 1: Timing Parameters ===
+    double baudRate;        // bits per second (e.g., 19200)
+    double propDelay;       // propagation delay (seconds)
+    double interByteTime;   // delay between bytes (seconds)
+
+    // Utility to compute transmission time of given bit length
+    double computeTxTime(int bits) {
+        return (double)bits / baudRate;
+    }
+
 protected:
     virtual void initialize() override;
     virtual void handleMessage(cMessage *msg) override;
 };
 
 #endif
-
