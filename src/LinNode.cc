@@ -1,5 +1,6 @@
 #include "LinNode.h"
 #include "LinDataFrame_m.h"
+#include "LinUtil.h"
 
 Define_Module(LinNode);
 
@@ -37,7 +38,12 @@ void LinNode::handleMessage(cMessage *msg) {
         LinDataFrame *header = new LinDataFrame("LIN_Header");
         header->setFrameId(slot.frameId);
         header->setIsResponse(false);
-        header->setDataLength(0);
+
+        // Step 3: protocol-correct header fields
+        header->setPid(computePID(slot.frameId));
+        header->setSyncByte(0x55);
+        header->setDataLength(0);   // no data in header
+
 
         // realistic header transmission: approximate header bits = break+sync+ID ≈ 34 bits
         int headerBits = 34;
@@ -70,8 +76,18 @@ void LinNode::handleMessage(cMessage *msg) {
             LinDataFrame *response = new LinDataFrame("LIN_Response");
             response->setFrameId(0x12);
             response->setIsResponse(true);
+
+            response->setPid(computePID(0x12));
             response->setDataLength(8);
-            for (int i = 0; i < 8; i++) response->setData(i, 'S');
+
+            for (int i = 0; i < 8; i++)
+                response->setData(i, 'S');
+
+            // Correct checksum
+            unsigned char sum = computeChecksum(response);
+            response->setChecksum(sum);
+
+
             // compute response transmission time: (data bytes + checksum) * 10 bits per byte (start/stop/parity/bit framing)
             int dataBytes = response->getDataLength();
             int responseBits = (dataBytes + 1) * 10; // +1 for checksum byte
@@ -86,8 +102,18 @@ void LinNode::handleMessage(cMessage *msg) {
             LinDataFrame *response = new LinDataFrame("LIN_Response");
             response->setFrameId(0x14);
             response->setIsResponse(true);
+
+            response->setPid(computePID(0x12));
             response->setDataLength(8);
-            for (int i = 0; i < 8; i++) response->setData(i, 'T');
+
+            for (int i = 0; i < 8; i++)
+                response->setData(i, 'T');
+
+            // Correct checksum
+            unsigned char sum = computeChecksum(response);
+            response->setChecksum(sum);
+
+
             // compute response transmission time: (data bytes + checksum) * 10 bits per byte (start/stop/parity/bit framing)
             int dataBytes = response->getDataLength();
             int responseBits = (dataBytes + 1) * 10; // +1 for checksum byte
