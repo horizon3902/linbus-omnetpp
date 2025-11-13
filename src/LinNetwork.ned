@@ -7,7 +7,7 @@ network LinNetwork
 		        baudRate = 19200bps;
 		        propDelay = 0.0001s;
 		        interByteTime = 0.0001s;
-		        @display("p=100,100");
+		        @display("p=100,100;t=LINbus");
 		}
 
 
@@ -17,7 +17,7 @@ network LinNetwork
                 baudRate = 19200bps;
                 propDelay = 0.0001s;
                 interByteTime = 0.0001s;
-                @display("p=100,200");
+                @display("p=100,200;t=MasterECU");
         }
 
         slave1: LinNode {
@@ -26,7 +26,7 @@ network LinNetwork
                 baudRate = 19200bps;
                 propDelay = 0.0001s;
                 interByteTime = 0.0001s;
-                @display("p=200,200");
+                @display("p=200,200;t=Slave1ECU");
         }
 
         slave2: LinNode {
@@ -35,7 +35,7 @@ network LinNetwork
                 baudRate = 19200bps;
                 propDelay = 0.0001s;
                 interByteTime = 0.0001s;
-                @display("p=300,200");
+                @display("p=300,200;t=Slave2ECU");
         }
 
     connections:
