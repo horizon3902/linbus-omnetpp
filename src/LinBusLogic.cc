@@ -19,15 +19,48 @@
 Define_Module(LinBusLogic);
 
 void LinBusLogic::initialize() {
-    EV << "LIN bus initialized\n";
+    EV_INFO << "Initializing LIN bus with schedule table" << endl;
+
+    // Master triggers these frames periodically
+    scheduleTable.push_back({0x10, "master", 0.01});
+    scheduleTable.push_back({0x12, "slave1", 0.01});
+    scheduleTable.push_back({0x14, "slave2", 0.01});
+
+    slotTimer = new cMessage("slotTimer");
+    scheduleAt(simTime() + scheduleTable[0].period, slotTimer);
 }
 
 void LinBusLogic::handleMessage(cMessage *msg) {
-    auto *frame = check_and_cast<LinDataFrame *>(msg);
-    EV << "Bus forwarding frame ID " << frame->getFrameId() << endl;
+    if (msg == slotTimer) {
+        LinSlot &slot = scheduleTable[currentSlotIndex];
+        EV_INFO << "Triggering slot for Frame ID " << slot.frameId
+                << " (publisher: " << slot.publisher << ")" << endl;
 
-    for (int i = 0; i < gateSize("gate$o"); i++)
-        send(frame->dup(), "gate$o", i);
+        LinDataFrame *header = new LinDataFrame("LIN_Header");
+        header->setFrameId(slot.frameId);
+        header->setIsResponse(false);
+        header->setDataLength(0);
 
-    delete frame;
+        // Broadcast the header
+        for (int i = 0; i < gateSize("gate$o"); i++) {
+            send(i == gateSize("gate$o") - 1 ? header : header->dup(), "gate$o", i);
+        }
+
+
+        // Move to next slot
+        currentSlotIndex = (currentSlotIndex + 1) % scheduleTable.size();
+        scheduleAt(simTime() + scheduleTable[currentSlotIndex].period, slotTimer);
+    }
+    else {
+        // Forward all received frames to all nodes (bus broadcast)
+        LinDataFrame *frame = check_and_cast<LinDataFrame *>(msg);
+        EV_INFO << "Bus forwarding frame ID " << frame->getFrameId() << endl;
+        for (int i = 0; i < gateSize("gate$o"); i++) {
+            send(i == gateSize("gate$o") - 1 ? frame : frame->dup(), "gate$o", i);
+        }
+
+
+    }
 }
+
+

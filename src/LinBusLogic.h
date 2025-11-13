@@ -20,6 +20,15 @@
 using namespace omnetpp;
 
 class LinBusLogic : public cSimpleModule {
+    struct LinSlot {
+        int frameId;
+        std::string publisher;
+        double period;
+    };
+
+    std::vector<LinSlot> scheduleTable;
+    int currentSlotIndex = 0;
+    cMessage *slotTimer = nullptr;
 protected:
     virtual void initialize() override;
     virtual void handleMessage(cMessage *msg) override;
