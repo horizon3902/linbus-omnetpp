@@ -1,3 +1,5 @@
+package src;
+
 module LinBus
 {
     parameters:

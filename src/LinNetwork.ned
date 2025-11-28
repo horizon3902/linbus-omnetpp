@@ -1,3 +1,5 @@
+package src;
+
 network LinNetwork
 {
     submodules:

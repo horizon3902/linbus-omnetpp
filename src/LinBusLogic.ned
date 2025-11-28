@@ -1,3 +1,5 @@
+package src;
+
 simple LinBusLogic
 {
     parameters:
