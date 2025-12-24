@@ -7,7 +7,11 @@ simple LinBusLogic
         double propDelay @unit(s) = default(0.0001s);
         double interByteTime @unit(s) = default(0.0001s);
 
-        int numGates;   // MUST BE PROVIDED BY NETWORK
+        // NEW: Error injection probabilities
+        double frameErrorRate = default(0); 
+        double frameDropRate = default(0);
+
+        int numGates;
     gates:
         inout gate[numGates];
 }

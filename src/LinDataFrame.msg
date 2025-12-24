@@ -21,4 +21,6 @@ packet LinResponse {
     int dataLength = 8;
     char data[8];
     char checksum;    // Classic or Enhanced checksum
+    // NEW: Flag to indicate this response collided on the bus
+    bool collision = false;
 }

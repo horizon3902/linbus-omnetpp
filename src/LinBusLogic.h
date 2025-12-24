@@ -5,23 +5,20 @@
 using namespace omnetpp;
 
 class LinBusLogic : public cSimpleModule {
-    struct LinSlot {
-        int frameId;
-        std::string publisher;
-        double period;
-    };
+    // Unused struct removed for cleanliness, or kept if you plan to use it later.
+    // Keeping minimal required members:
 
-    std::vector<LinSlot> scheduleTable;
+    double baudRate;
+    double propDelay;
+    double interByteTime;
 
-    // === Step 1: Timing Parameters ===
-    double baudRate;        // bits per second (e.g., 19200)
-    double propDelay;       // propagation delay (seconds)
-    double interByteTime;   // delay between bytes (seconds)
+    // NEW: Error parameters
+    double frameErrorRate;
+    double frameDropRate;
 
-    // Utility to compute transmission time of given bit length
-    double computeTxTime(int bits) {
-        return (double)bits / baudRate;
-    }
+    // NEW: Collision Detection State
+    bool isResponseOnBus;
+    cMessage *transmissionEndTimer;
 
 protected:
     virtual void initialize() override;
