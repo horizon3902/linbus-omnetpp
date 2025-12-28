@@ -14,13 +14,15 @@ enum LinNodeState {
     WAIT_FOR_PID,
     TRANSMITTING,
     RECEIVING,
-    SLEEP // NEW (Phase 3): Sleep state for power management
+    SLEEP
 };
 
 struct LinSlot {
     int frameId;
     std::string publisher;
     double period;
+    // NEW: ISO Compliance - Track if this slot is for an Event-Triggered Frame
+    bool isETF = false;
 };
 
 struct LinSignal {
@@ -52,13 +54,18 @@ private:
     cMessage *headerTimer;
     cMessage *responseTimeoutTimer;
 
-    // NEW (Phase 3): Timer to trigger a Wakeup Pulse (simulating external event)
-    cMessage *wakeupTimer;
+    // Wakeup timers
+    cMessage *wakeupTimer;           // Triggers the initial pulse (simulated external event)
+    cMessage *wakeupExpirationTimer; // Tracks the 150ms timeout waiting for Master header
 
     int pendingResponseFrameId = -1;
 
-    // NEW (Phase 3): Flag to pause/resume master schedule during sleep
+    // Flag to pause/resume master schedule during sleep
     bool scheduleRunning = true;
+
+    // --- WAKEUP LOGIC STATE ---
+    int wakeupRetryCount = 0; // ISO allows 3 retries
+    bool pendingWakeup = false; // True if we sent a pulse and are waiting for header
 
     // --- PHY PARAMETERS ---
     double baudRate;
@@ -69,7 +76,7 @@ private:
     std::vector<LinSlot> scheduleTable;
     int currentSlotIndex = 0;
 
-    // Collision Resolution Schedule (Phase 2)
+    // Collision Resolution Schedule
     std::vector<LinSlot> collisionScheduleTable;
     bool resolvingCollision = false;
     int collisionSlotIndex = 0;
@@ -89,18 +96,15 @@ private:
 
     // --- PROTOCOL ACTIONS ---
     void sendBreakSignal();
-
-    // NEW (Phase 3): Send a long dominant pulse to wake up the bus
     void sendWakeupPulse();
-
     void sendHeaderRemainder(int frameId, std::string publisher);
     void sendResponse(int frameId, double initialDelay);
     void processReceivedHeader(LinHeader *header);
 
-    // Trigger switch to collision resolution table (Phase 2)
+    // Trigger switch to collision resolution table
     void startCollisionResolution();
 
-    // NEW (Phase 3): Check if a received break is long enough to be a Wakeup
+    // Check if a received break is long enough to be a Wakeup
     bool isWakeupPulse(LinBreakSignal *brk);
 
 protected:

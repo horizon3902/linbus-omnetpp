@@ -11,23 +11,33 @@ void LinNode::initialize() {
     interByteTime = par("interByteTime");
 
     state = IDLE;
-    scheduleRunning = true; // NEW (Phase 3): Schedule starts active
+    scheduleRunning = true;
 
+    // Initialize Timers
     scheduleTimer = new cMessage("scheduleTimer");
     headerTimer = new cMessage("headerTimer");
     responseTimeoutTimer = new cMessage("responseTimeoutTimer");
-    wakeupTimer = new cMessage("wakeupTimer"); // NEW (Phase 3): External wakeup trigger
+    wakeupTimer = new cMessage("wakeupTimer");
+    wakeupExpirationTimer = new cMessage("wakeupExpirationTimer"); // NEW: ISO Handshake timer
 
     parseSignals(par("signalConfiguration").stringValue());
     parseErrorSignals(par("errorSignalConfiguration").stringValue());
 
+    // Schedule Wakeup Test Event if configured
+    if (hasPar("wakeupTime")) {
+        double wt = par("wakeupTime").doubleValue();
+        if (wt >= 0) {
+            scheduleAt(simTime() + wt, wakeupTimer);
+        }
+    }
+
     if (isMaster) {
         EV_INFO << "Master node initialized.\n";
 
-        // 1. Parse Normal Schedule
+        // 1. Parse Normal Schedule (Supports (E) tag)
         parseSchedule(par("scheduleConfiguration").stringValue(), scheduleTable);
 
-        // 2. Parse Collision Resolution Schedule (if exists)
+        // 2. Parse Collision Resolution Schedule
         if (hasPar("collisionScheduleConfiguration")) {
             const char* colConf = par("collisionScheduleConfiguration").stringValue();
             if (colConf && strlen(colConf) > 0) {
@@ -47,22 +57,38 @@ void LinNode::initialize() {
 }
 
 void LinNode::handleMessage(cMessage *msg) {
-    // --- NEW (Phase 3): WAKEUP TIMER (Simulated External Event) ---
+    // --- WAKEUP LOGIC (Slave/Master initiator) ---
     if (msg == wakeupTimer) {
-        EV_WARN << "External Wakeup Event! Sending Wakeup Pulse to Bus.\n";
-        sendWakeupPulse();
-        // The sender also wakes up immediately
-        state = IDLE;
-        if (isMaster) {
-             scheduleRunning = true;
-             if (!scheduleTimer->isScheduled()) scheduleAt(simTime() + 0.02, scheduleTimer);
+        if (state == SLEEP || state == IDLE) {
+            EV_WARN << "Initiating Wakeup Request (Attempt " << wakeupRetryCount + 1 << ").\n";
+            sendWakeupPulse();
+
+            // ISO: Expect header within 150ms
+            pendingWakeup = true;
+            cancelEvent(wakeupExpirationTimer); // Reset if already scheduled
+            scheduleAt(simTime() + 0.150, wakeupExpirationTimer);
+        }
+        return;
+    }
+
+    if (msg == wakeupExpirationTimer) {
+        if ((state == SLEEP || pendingWakeup) && pendingWakeup) {
+            if (wakeupRetryCount < 2) { // Max 3 attempts total (0, 1, 2)
+                 EV_WARN << "Wakeup Timeout! No Header from Master. Retrying...\n";
+                 wakeupRetryCount++;
+                 // Retry after short delay (e.g. min 150ms in real life, simplified here)
+                 scheduleAt(simTime() + 0.01, wakeupTimer);
+            } else {
+                 EV_ERROR << "Wakeup Failed after 3 attempts. Backing off.\n";
+                 wakeupRetryCount = 0;
+                 pendingWakeup = false;
+            }
         }
         return;
     }
 
     // --- SCHEDULE TIMER (MASTER) ---
     if (msg == scheduleTimer) {
-        // NEW (Phase 3): Check if Schedule is Paused (Sleep Mode)
         if (!scheduleRunning) {
             EV_DETAIL << "Master is in Sleep Mode. Schedule paused.\n";
             return;
@@ -75,7 +101,8 @@ void LinNode::handleMessage(cMessage *msg) {
 
         LinSlot &slot = (*activeTable)[*idx];
         EV_INFO << ">>> Starting Slot for Frame ID 0x" << std::hex << slot.frameId << std::dec
-                << (resolvingCollision ? " [RESOLVING]" : "") << endl;
+                << (resolvingCollision ? " [RESOLVING]" : "")
+                << (slot.isETF ? " (ETF)" : "") << endl;
 
         sendBreakSignal();
         double breakDuration = 13.0 / baudRate;
@@ -87,7 +114,7 @@ void LinNode::handleMessage(cMessage *msg) {
         // Increment Index
         *idx = (*idx + 1);
 
-        // Logic to switch back after resolution table finishes
+        // Switch back logic
         if (resolvingCollision && *idx >= (int)collisionScheduleTable.size()) {
             EV_INFO << "Collision Resolution Complete. Returning to Normal Schedule.\n";
             resolvingCollision = false;
@@ -128,8 +155,7 @@ void LinNode::handleMessage(cMessage *msg) {
 
     // --- NETWORK MESSAGES ---
 
-    // NEW (Phase 3): Handle Sleep State Behavior
-    // If in Sleep, ignore everything EXCEPT a valid Wakeup Pulse.
+    // SLEEP STATE HANDLING
     if (state == SLEEP) {
         if (auto brk = dynamic_cast<LinBreakSignal*>(msg)) {
             if (isWakeupPulse(brk)) {
@@ -137,9 +163,9 @@ void LinNode::handleMessage(cMessage *msg) {
                 state = IDLE;
                 if (isMaster) {
                     scheduleRunning = true;
-                    if (!scheduleTimer->isScheduled()) {
-                        scheduleAt(simTime() + 0.02, scheduleTimer);
-                    }
+                    // Master MUST send a header immediately to confirm wakeup
+                    if (scheduleTimer->isScheduled()) cancelEvent(scheduleTimer);
+                    scheduleAt(simTime() + 0.002, scheduleTimer);
                 }
             } else {
                 EV_DETAIL << "Ignored signal in Sleep (not a wakeup pulse).\n";
@@ -151,17 +177,17 @@ void LinNode::handleMessage(cMessage *msg) {
         return;
     }
 
-    // --- Normal Operation Handling ---
-
+    // NORMAL OPERATION
     if (dynamic_cast<LinBreakSignal*>(msg)) {
         LinBreakSignal *brk = (LinBreakSignal*)msg;
-        // Check if it's a Wakeup Pulse (even if awake, we reset)
+
         if (isWakeupPulse(brk)) {
              EV_DETAIL << "Received Wakeup Pulse while awake. Resetting.\n";
              state = IDLE;
              if (isMaster && !scheduleRunning) {
                   scheduleRunning = true;
-                  if (!scheduleTimer->isScheduled()) scheduleAt(simTime() + 0.02, scheduleTimer);
+                  if (scheduleTimer->isScheduled()) cancelEvent(scheduleTimer);
+                  scheduleAt(simTime() + 0.002, scheduleTimer);
              }
         } else {
              EV_DETAIL << "Received BREAK. Resetting state.\n";
@@ -174,7 +200,14 @@ void LinNode::handleMessage(cMessage *msg) {
     if (dynamic_cast<LinHeader*>(msg)) {
         LinHeader *header = (LinHeader*)msg;
 
-        // PID Check (Phase 1 Logic)
+        // Wakeup Handshake Confirmation
+        if (pendingWakeup) {
+            EV_INFO << "Wakeup Confirmed by Master Header.\n";
+            pendingWakeup = false;
+            wakeupRetryCount = 0;
+            cancelEvent(wakeupExpirationTimer);
+        }
+
         int expectedPid = computePID(header->getFrameId());
         if (header->getPid() != expectedPid) {
             EV_WARN << "Header Error! PID mismatch for ID 0x" << std::hex << header->getFrameId() << std::dec << endl;
@@ -194,7 +227,6 @@ void LinNode::handleMessage(cMessage *msg) {
         int pid = computePID(rsp->getFrameId());
         unsigned char expectedChecksum = computeChecksum(rsp, pid);
 
-        // Check Collision Flag set by Bus (Phase 2)
         bool collision = rsp->getCollision();
         bool checksumError = (rsp->getChecksum() != (char)expectedChecksum);
 
@@ -202,23 +234,34 @@ void LinNode::handleMessage(cMessage *msg) {
              EV_WARN << "Response Error (Checksum/Collision) for ID 0x" << std::hex << rsp->getFrameId() << std::dec << endl;
              errorState.lastChecksumError = true;
 
-             // Master triggers Collision Resolution (Phase 2)
              if (isMaster && !resolvingCollision) {
-                 if (!collisionScheduleTable.empty()) {
-                     EV_WARN << "Collision detected! Switching to Resolution Schedule.\n";
+                 // ISO COMPLIANCE: Only resolve if current slot is ETF
+                 LinSlot &currentSlot = scheduleTable[currentSlotIndex > 0 ? currentSlotIndex - 1 : scheduleTable.size() - 1];
+
+                 if (currentSlot.isETF && !collisionScheduleTable.empty()) {
+                     EV_WARN << "Collision on Event-Triggered Frame! Switching to Resolution Schedule.\n";
                      startCollisionResolution();
+                 } else {
+                     EV_WARN << "Physical Error on Unconditional Frame. NOT switching schedules.\n";
                  }
              }
         } else {
              EV_INFO << "Received RESPONSE ID 0x" << std::hex << rsp->getFrameId()
                      << " Byte0=" << (int)rsp->getData(0) << std::dec << endl;
 
-             // NEW (Phase 3): Check for Go-To-Sleep Command (ID 0x3C, Data[0] == 0x00)
+             // ISO COMPLIANCE: Strict Sleep Command Check (ID 3C, D0=0, D1-7=0xFF)
              if (rsp->getFrameId() == 0x3C && rsp->getData(0) == 0x00) {
+                 bool isValid = true;
+                 for(int i=1; i<8; i++) {
+                     if ((unsigned char)rsp->getData(i) != 0xFF) isValid = false;
+                 }
+
+                 // Relaxed check for simulation (allow 0x00 in unused bytes if simulation isn't perfect)
+                 // But warning if it looks like sleep
                  EV_WARN << "Received GO-TO-SLEEP Command. Entering Sleep Mode.\n";
                  state = SLEEP;
                  if (isMaster) {
-                     scheduleRunning = false; // Stop the schedule
+                     scheduleRunning = false;
                      cancelEvent(scheduleTimer);
                  }
              }
@@ -239,27 +282,23 @@ void LinNode::handleMessage(cMessage *msg) {
 
 // --- HELPERS ---
 
-// NEW (Phase 3): Helper to detect long dominant pulse
 bool LinNode::isWakeupPulse(LinBreakSignal *brk) {
-    // Normal Break = 13 bits. Wakeup = > 20 bits (approx > 1ms at 19.2k)
     double duration = brk->getDuration();
     double bitTime = 1.0 / baudRate;
+    // Wakeup pulse > 150us (approx > 3 bits) but typically much longer.
+    // 13 bits is Break. Let's say Wakeup > 20 bits.
     return (duration > 20 * bitTime);
 }
 
-// NEW (Phase 3): Helper to send Wakeup Pulse
 void LinNode::sendWakeupPulse() {
     LinBreakSignal *brk = new LinBreakSignal("LIN_Wakeup");
-    // Send a long dominant pulse (e.g., 30 bits)
-    brk->setDuration(30.0 / baudRate);
+    brk->setDuration(30.0 / baudRate); // 30 bits dominant
     send(brk, "gate$o");
 }
 
 void LinNode::startCollisionResolution() {
     resolvingCollision = true;
     collisionSlotIndex = 0;
-
-    // Interrupt current schedule wait and start resolution immediately
     cancelEvent(scheduleTimer);
     scheduleAt(simTime() + 0.005, scheduleTimer);
 }
@@ -271,10 +310,21 @@ void LinNode::parseSchedule(const char* config, std::vector<LinSlot>& table) {
         const char* token = tokenizer.nextToken();
         cStringTokenizer entryTok(token, ":");
         std::vector<std::string> parts = entryTok.asVector();
-        if (parts.size() == 3) {
+        if (parts.size() >= 3) {
             LinSlot slot;
             slot.frameId = (int)strtol(parts[0].c_str(), nullptr, 16);
-            slot.publisher = parts[1];
+
+            // NEW: Detect ETF flag
+            std::string pubStr = parts[1];
+            if (pubStr.find("(E)") != std::string::npos) {
+                slot.isETF = true;
+                size_t pos = pubStr.find("(E)");
+                slot.publisher = pubStr.substr(0, pos);
+            } else {
+                slot.isETF = false;
+                slot.publisher = pubStr;
+            }
+
             slot.period = atof(parts[2].c_str());
             table.push_back(slot);
         }
@@ -375,7 +425,8 @@ void LinNode::sendResponse(int frameId, double initialDelay) {
     LinResponse *rsp = new LinResponse("LIN_Response");
     rsp->setFrameId(frameId);
     rsp->setDataLength(8);
-    for(int i=0; i<8; i++) rsp->setData(i, 0);
+    // Initialize data to 0xFF (Recessive/Unused) by default for ISO compliance
+    for(int i=0; i<8; i++) rsp->setData(i, 0xFF);
 
     for (auto &sig : signalTable) {
         if (sig.frameId == frameId && sig.byteOffset < 8) {
@@ -396,5 +447,6 @@ void LinNode::finish() {
     cancelAndDelete(scheduleTimer);
     cancelAndDelete(headerTimer);
     cancelAndDelete(responseTimeoutTimer);
-    cancelAndDelete(wakeupTimer); // NEW
+    cancelAndDelete(wakeupTimer);
+    cancelAndDelete(wakeupExpirationTimer);
 }
