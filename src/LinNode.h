@@ -58,22 +58,17 @@ private:
     cMessage *wakeupTimer;
     cMessage *wakeupExpirationTimer;
 
-    // Milestone 1: master must be able to enter sleep even if it ignores echo
     cMessage *goToSleepTimer;
 
-    // Milestone 2: event generation / re-arm timer
     cMessage *eventRearmTimer;
 
-    // Milestone 3: inactivity sleep timer
     cMessage *inactivityTimer;
     double inactivitySleepTime = 4.0;
 
     int pendingResponseFrameId = -1;
     bool scheduleRunning = true;
 
-    // --- RX QUALIFICATION (FIX) ---
-    // For non-master nodes: accept a response only if a valid header was received,
-    // and (optionally) only if a BREAK was seen before that header.
+    // --- RX QUALIFICATION ---
     bool rxSawBreak = false;
     bool rxAwaitingResponse = false;
     int  rxExpectedResponseId = -1;
@@ -87,6 +82,13 @@ private:
     double propDelay;
     double interByteTime;
 
+    // NEW: break/delimiter timing knobs
+    int breakBits = 13;
+    int delimiterBits = 1;
+
+    // --- DLC CONFIG ---
+    std::unordered_map<int,int> frameIdToDlc;
+
     // --- SCHEDULE TABLES ---
     std::vector<LinSlot> scheduleTable;
     int currentSlotIndex = 0;
@@ -95,7 +97,6 @@ private:
     bool resolvingCollision = false;
     int collisionSlotIndex = 0;
 
-    // Latch slot used by headerTimer
     LinSlot pendingHeaderSlot;
     bool pendingHeaderValid = false;
     bool endResolveAfterHeader = false;
@@ -105,7 +106,7 @@ private:
     std::vector<LinErrorSignalBinding> errorBindings;
     LinErrorState errorState;
 
-    // --- MILESTONE 2: ETF MAP + EVENT FLAGS ---
+    // --- ETF MAP + EVENT FLAGS ---
     std::unordered_map<int, std::vector<int>> etfToUcfs;
     std::unordered_map<int, bool> ucfEventPending;
 
@@ -117,23 +118,26 @@ private:
     void parseSignals(const char* config);
     void parseErrorSignals(const char* config);
 
-    // Milestone 2
+    // DLC
+    void parseFrameDlcs(const char* config);
+    int dlcForFrame(int frameId) const;
+
+    // ETF
     void parseEventFrames(const char* config);
     void initializeEventFlags();
     bool isEventFrameId(int etfId) const;
     bool selectUcfForEventFrame(int etfId, int& outUcfId) const;
     void setEventPending(int ucfId, bool pending);
 
-    // Milestone 3
+    // Sleep/Inactivity
     void resetInactivityTimer();
     void enterSleep(const char *reason);
 
-    // FIX
+    // RX context
     void resetRxContext();
 
     bool isPublisherFor(int frameId);
     void applyErrorBits(int logicalFrameId, LinResponse *rsp, int payloadBase);
-
     bool isGoToSleepCommand(const LinResponse *rsp) const;
 
     // Timing helpers

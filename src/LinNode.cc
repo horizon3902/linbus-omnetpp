@@ -12,6 +12,11 @@ void LinNode::initialize() {
     propDelay = par("propDelay");
     interByteTime = par("interByteTime");
 
+    breakBits = par("breakBits").intValue();
+    delimiterBits = par("delimiterBits").intValue();
+    if (breakBits < 1) breakBits = 13;
+    if (delimiterBits < 0) delimiterBits = 1;
+
     state = IDLE;
     scheduleRunning = true;
 
@@ -22,23 +27,23 @@ void LinNode::initialize() {
     wakeupExpirationTimer = new cMessage("wakeupExpirationTimer");
     goToSleepTimer = new cMessage("goToSleepTimer");
 
-    // Milestone 2
     eventRearmTimer = new cMessage("eventRearmTimer");
     eventRearmPeriod = par("eventRearmPeriod").doubleValue();
     eventProbability = par("eventProbability").doubleValue();
 
-    // Milestone 3
     inactivityTimer = new cMessage("inactivityTimer");
     inactivitySleepTime = par("inactivitySleepTime").doubleValue();
     resetInactivityTimer();
 
-    // FIX
     resetRxContext();
 
     parseSignals(par("signalConfiguration").stringValue());
     parseErrorSignals(par("errorSignalConfiguration").stringValue());
 
-    // Milestone 2: ETF mapping + event flags
+    // DLC map
+    parseFrameDlcs(par("frameDlcConfiguration").stringValue());
+
+    // ETF mapping + event flags
     parseEventFrames(par("eventFrameConfiguration").stringValue());
     initializeEventFlags();
     if (eventRearmPeriod >= 0) {
@@ -86,18 +91,52 @@ double LinNode::responseTxTime(int dataLength) const {
     return (double)((n + 1) * 10) / baudRate;
 }
 
+void LinNode::resetRxContext() {
+    rxSawBreak = false;
+    rxAwaitingResponse = false;
+    rxExpectedResponseId = -1;
+}
+
+void LinNode::parseFrameDlcs(const char* config) {
+    frameIdToDlc.clear();
+    if (!config || strlen(config) == 0) return;
+
+    // Format: "10=2;21=4;22=4;3C=8"
+    cStringTokenizer tokenizer(config, ";");
+    while (tokenizer.hasMoreTokens()) {
+        const char* token = tokenizer.nextToken();
+        cStringTokenizer kvTok(token, "=");
+        std::vector<std::string> kv = kvTok.asVector();
+        if (kv.size() != 2) continue;
+
+        int frameId = (int)strtol(kv[0].c_str(), nullptr, 16);
+        int dlc = atoi(kv[1].c_str());
+        if (dlc < 0) dlc = 0;
+        if (dlc > 8) dlc = 8;
+
+        frameIdToDlc[frameId] = dlc;
+    }
+}
+
+int LinNode::dlcForFrame(int frameId) const {
+    auto it = frameIdToDlc.find(frameId);
+    if (it != frameIdToDlc.end()) return it->second;
+    return 8; // default
+}
+
 bool LinNode::isGoToSleepCommand(const LinResponse *rsp) const {
     if (!rsp) return false;
     if (rsp->getFrameId() != 0x3C) return false;
     if ((unsigned char)rsp->getData(0) != 0x00) return false;
 
-    for (int i = 1; i < 8; i++) {
+    for (int i = 1; i < rsp->getDataLength(); i++) {
         if ((unsigned char)rsp->getData(i) != 0xFF) return false;
     }
+    // For a strict LIN 2.x GOTO-SLEEP, DLC should be 8; keep model tolerant.
     return true;
 }
 
-// -------------------- Milestone 2 helpers --------------------
+// -------------------- ETF helpers --------------------
 void LinNode::parseEventFrames(const char* config) {
     etfToUcfs.clear();
     if (!config || strlen(config) == 0) return;
@@ -166,23 +205,16 @@ void LinNode::setEventPending(int ucfId, bool pending) {
         it->second = pending;
     }
 }
-// -------------------------------------------------------------
+// -----------------------------------------------------
 
-// -------------------- Milestone 3 helpers --------------------
+// -------------------- Inactivity sleep helpers --------------------
 void LinNode::resetInactivityTimer() {
     if (inactivitySleepTime < 0) return;
 
     cancelEvent(inactivityTimer);
-
     if (state != SLEEP) {
         scheduleAt(simTime() + inactivitySleepTime, inactivityTimer);
     }
-}
-
-void LinNode::resetRxContext() {
-    rxSawBreak = false;
-    rxAwaitingResponse = false;
-    rxExpectedResponseId = -1;
 }
 
 void LinNode::enterSleep(const char *reason) {
@@ -191,11 +223,9 @@ void LinNode::enterSleep(const char *reason) {
     EV_WARN << "Entering Sleep Mode (" << reason << ").\n";
     state = SLEEP;
 
-    // stop timers that don't make sense in sleep
     cancelEvent(responseTimeoutTimer);
     pendingResponseFrameId = -1;
 
-    // FIX: reset receive context when sleeping
     resetRxContext();
 
     if (isMaster) {
@@ -205,16 +235,16 @@ void LinNode::enterSleep(const char *reason) {
 
     cancelEvent(inactivityTimer);
 }
-// -------------------------------------------------------------
+// -----------------------------------------------------
 
 void LinNode::handleMessage(cMessage *msg) {
-    // Milestone 3: inactivity timer fired => sleep
+    // inactivity => sleep
     if (msg == inactivityTimer) {
         enterSleep("inactivity timeout");
         return;
     }
 
-    // Milestone 2: periodic event re-arm
+    // periodic event re-arm
     if (msg == eventRearmTimer) {
         for (auto &kv : ucfEventPending) {
             bool setIt = (uniform(0, 1) < eventProbability);
@@ -224,14 +254,14 @@ void LinNode::handleMessage(cMessage *msg) {
         return;
     }
 
-    // Milestone 1: master-local sleep entry (because master ignores echo frames)
+    // master-local sleep completion
     if (msg == goToSleepTimer) {
         EV_WARN << "GO-TO-SLEEP (local) completed.\n";
         enterSleep("go-to-sleep completed");
         return;
     }
 
-    // --- WAKEUP LOGIC ---
+    // --- wakeup logic ---
     if (msg == wakeupTimer) {
         if (state == SLEEP || state == IDLE) {
             EV_WARN << "Initiating Wakeup Request (Attempt " << wakeupRetryCount + 1 << ").\n";
@@ -242,7 +272,6 @@ void LinNode::handleMessage(cMessage *msg) {
                 EV_INFO << "Wakeup initiated locally. Waiting for Master Header confirmation.\n";
             }
 
-            // FIX: waking locally resets RX context
             resetRxContext();
             resetInactivityTimer();
 
@@ -268,7 +297,7 @@ void LinNode::handleMessage(cMessage *msg) {
         return;
     }
 
-    // --- MASTER SCHEDULE ---
+    // --- master schedule ---
     if (msg == scheduleTimer) {
         if (!scheduleRunning) {
             EV_DETAIL << "Master is in Sleep Mode. Schedule paused.\n";
@@ -277,7 +306,6 @@ void LinNode::handleMessage(cMessage *msg) {
 
         std::vector<LinSlot> *activeTable = resolvingCollision ? &collisionScheduleTable : &scheduleTable;
         int *idx = resolvingCollision ? &collisionSlotIndex : &currentSlotIndex;
-
         if (activeTable->empty()) return;
 
         LinSlot &slot = (*activeTable)[*idx];
@@ -289,17 +317,14 @@ void LinNode::handleMessage(cMessage *msg) {
         pendingHeaderSlot = slot;
         pendingHeaderValid = true;
 
-        if (resolvingCollision && (*idx == (int)collisionScheduleTable.size() - 1)) {
-            endResolveAfterHeader = true;
-        } else {
-            endResolveAfterHeader = false;
-        }
+        endResolveAfterHeader = (resolvingCollision && (*idx == (int)collisionScheduleTable.size() - 1));
 
         sendBreakSignal();
         resetInactivityTimer();
 
-        double breakDuration = 13.0 / baudRate;
-        scheduleAt(simTime() + breakDuration + interByteTime, headerTimer);
+        double tBreak = (double)breakBits / baudRate;
+        double tDelim = (double)delimiterBits / baudRate;
+        scheduleAt(simTime() + tBreak + tDelim + interByteTime, headerTimer);
 
         scheduleAt(simTime() + slot.period, scheduleTimer);
 
@@ -319,12 +344,13 @@ void LinNode::handleMessage(cMessage *msg) {
         sendHeaderRemainder(slot.frameId, slot.publisher);
         resetInactivityTimer();
 
-        // ETF slots may be silent => no timeout for ETF
+        // timeout only for non-ETF unconditional frames where master is subscriber
         if (isMaster && !slot.isETF && !isPublisherFor(slot.frameId)) {
             pendingResponseFrameId = slot.frameId;
 
             double tHeaderNom = headerRemainderTxTime();
-            double tRespNom   = responseTxTime(8);
+            int dlc = dlcForFrame(slot.frameId);
+            double tRespNom = responseTxTime(dlc);
 
             double timeout =
                 1.4 * tHeaderNom +
@@ -342,11 +368,10 @@ void LinNode::handleMessage(cMessage *msg) {
             collisionSlotIndex = 0;
             endResolveAfterHeader = false;
         }
-
         return;
     }
 
-    // --- TIMEOUT TIMER ---
+    // master timeout waiting for response
     if (msg == responseTimeoutTimer) {
         if (pendingResponseFrameId != -1) {
             EV_WARN << "Master TIMEOUT waiting for ID 0x" << std::hex << pendingResponseFrameId << std::dec << endl;
@@ -356,10 +381,10 @@ void LinNode::handleMessage(cMessage *msg) {
         return;
     }
 
-    // Any received bus traffic counts as activity
+    // any received traffic counts as activity
     resetInactivityTimer();
 
-    // --- NETWORK MESSAGES ---
+    // --- sleep state handling ---
     if (state == SLEEP) {
         if (auto brk = dynamic_cast<LinBreakSignal*>(msg)) {
             if (isEchoFromSelf(brk->getSourceAddr())) { delete msg; return; }
@@ -393,19 +418,15 @@ void LinNode::handleMessage(cMessage *msg) {
         if (isWakeupPulse(brk)) {
             EV_DETAIL << "Received Wakeup Pulse while awake. Resetting.\n";
             state = IDLE;
-
-            // FIX: wakeup resets RX context
             resetRxContext();
         } else {
             EV_DETAIL << "Received BREAK. Resetting state.\n";
             state = WAIT_FOR_SYNC;
 
-            // FIX: BREAK qualifies the next header and closes any previous response window
             rxSawBreak = true;
             rxAwaitingResponse = false;
             rxExpectedResponseId = -1;
         }
-
         delete msg;
         return;
     }
@@ -421,7 +442,7 @@ void LinNode::handleMessage(cMessage *msg) {
             cancelEvent(wakeupExpirationTimer);
         }
 
-        // FIX: For non-master nodes, require BREAK before accepting a header
+        // require BREAK before accepting a header on slaves
         if (!isMaster) {
             if (!rxSawBreak) {
                 EV_DETAIL << "Ignoring HEADER without preceding BREAK for ID 0x"
@@ -429,7 +450,6 @@ void LinNode::handleMessage(cMessage *msg) {
                 delete msg;
                 return;
             }
-            // consume the BREAK qualification
             rxSawBreak = false;
         }
 
@@ -438,7 +458,6 @@ void LinNode::handleMessage(cMessage *msg) {
             EV_WARN << "Header Error! PID mismatch for ID 0x" << std::hex << header->getFrameId() << std::dec << endl;
             errorState.lastHeaderError = true;
 
-            // FIX: invalidate any pending response expectation
             if (!isMaster) {
                 rxAwaitingResponse = false;
                 rxExpectedResponseId = -1;
@@ -448,7 +467,6 @@ void LinNode::handleMessage(cMessage *msg) {
             return;
         }
 
-        // FIX: valid header => remember which response is allowed next (for slaves)
         if (!isMaster) {
             rxAwaitingResponse = true;
             rxExpectedResponseId = header->getFrameId();
@@ -463,7 +481,6 @@ void LinNode::handleMessage(cMessage *msg) {
     if (auto rsp = dynamic_cast<LinResponse*>(msg)) {
         if (isEchoFromSelf(rsp->getSourceAddr())) { delete msg; return; }
 
-        // FIX: slaves accept a response only if a valid header was accepted for same ID
         if (!isMaster) {
             if (!rxAwaitingResponse || rsp->getFrameId() != rxExpectedResponseId) {
                 EV_DETAIL << "Ignoring RESPONSE without valid matching header. Resp ID 0x"
@@ -471,12 +488,10 @@ void LinNode::handleMessage(cMessage *msg) {
                 delete msg;
                 return;
             }
-            // close the window now (whether it is good/bad)
             rxAwaitingResponse = false;
             rxExpectedResponseId = -1;
         }
 
-        // If master was waiting for this frame, any response ends the wait.
         if (isMaster && rsp->getFrameId() == pendingResponseFrameId) {
             cancelEvent(responseTimeoutTimer);
             pendingResponseFrameId = -1;
@@ -510,13 +525,15 @@ void LinNode::handleMessage(cMessage *msg) {
                 int innerId = (int)(innerPid & 0x3F);
                 EV_INFO << "Received ETF RESPONSE (ETF ID 0x" << std::hex << rsp->getFrameId()
                         << ") from UCF ID 0x" << innerId
-                        << " Byte1=" << (unsigned int)(unsigned char)rsp->getData(1) << std::dec << endl;
+                        << " Byte1=" << (rsp->getDataLength() > 1 ? (unsigned int)(unsigned char)rsp->getData(1) : 0)
+                        << std::dec << endl;
             } else {
                 EV_INFO << "Received RESPONSE ID 0x" << std::hex << rsp->getFrameId()
-                        << " Byte0=" << (unsigned int)(unsigned char)rsp->getData(0) << std::dec << endl;
+                        << " Byte0=" << (rsp->getDataLength() > 0 ? (unsigned int)(unsigned char)rsp->getData(0) : 0)
+                        << std::dec << endl;
             }
 
-            if (rsp->getFrameId() == 0x3C && (unsigned char)rsp->getData(0) == 0x00) {
+            if (rsp->getFrameId() == 0x3C && rsp->getDataLength() > 0 && (unsigned char)rsp->getData(0) == 0x00) {
                 EV_WARN << "Received GO-TO-SLEEP Command.\n";
                 enterSleep("received go-to-sleep");
             }
@@ -539,7 +556,8 @@ bool LinNode::isWakeupPulse(LinBreakSignal *brk) {
 
 void LinNode::sendWakeupPulse() {
     LinBreakSignal *brk = new LinBreakSignal("LIN_Wakeup");
-    brk->setSourceAddr(nodeAddress);
+    brk->setSourceAddr(nodeAddress);  // true node identity
+    brk->setIngressPortIndex(-1);
     brk->setDuration(30.0 / baudRate);
     send(brk, "gate$o");
     resetInactivityTimer();
@@ -623,15 +641,17 @@ bool LinNode::isPublisherFor(int frameId) {
 
 void LinNode::sendBreakSignal() {
     LinBreakSignal *brk = new LinBreakSignal("LIN_Break");
-    brk->setSourceAddr(nodeAddress);
-    brk->setDuration(13.0 / baudRate);
+    brk->setSourceAddr(nodeAddress);   // true node identity
+    brk->setIngressPortIndex(-1);
+    brk->setDuration((double)breakBits / baudRate);
     send(brk, "gate$o");
     resetInactivityTimer();
 }
 
 void LinNode::sendHeaderRemainder(int frameId, std::string publisher) {
     LinHeader *header = new LinHeader("LIN_Header");
-    header->setSourceAddr(nodeAddress);
+    header->setSourceAddr(nodeAddress); // true node identity
+    header->setIngressPortIndex(-1);
     header->setFrameId(frameId);
     header->setPid(computePID(frameId));
     header->setSyncByte(0x55);
@@ -692,13 +712,16 @@ void LinNode::applyErrorBits(int logicalFrameId, LinResponse *rsp, int payloadBa
 void LinNode::sendResponse(int frameId, double initialDelay) {
     LinResponse *rsp = new LinResponse("LIN_Response");
     rsp->setSourceAddr(nodeAddress);
+    rsp->setIngressPortIndex(-1);
     rsp->setFrameId(frameId);
-    rsp->setDataLength(8);
 
-    for (int i = 0; i < 8; i++) rsp->setData(i, 0xFF);
+    int dlc = dlcForFrame(frameId);
+    rsp->setDataLength(dlc);
+
+    for (int i = 0; i < dlc; i++) rsp->setData(i, (char)0xFF);
 
     for (auto &sig : signalTable) {
-        if (sig.frameId == frameId && sig.byteOffset < 8) {
+        if (sig.frameId == frameId && sig.byteOffset >= 0 && sig.byteOffset < dlc) {
             rsp->setData(sig.byteOffset, (char)sig.value);
         }
     }
@@ -724,16 +747,23 @@ void LinNode::sendResponse(int frameId, double initialDelay) {
 void LinNode::sendEventResponse(int etfId, int ucfId, double initialDelay) {
     LinResponse *rsp = new LinResponse("LIN_EventResponse");
     rsp->setSourceAddr(nodeAddress);
+    rsp->setIngressPortIndex(-1);
     rsp->setFrameId(etfId);
-    rsp->setDataLength(8);
 
-    for (int i = 0; i < 8; i++) rsp->setData(i, 0xFF);
+    int dlc = dlcForFrame(etfId);
+    if (dlc < 1) dlc = 1; // must have room for inner PID
+    rsp->setDataLength(dlc);
+
+    for (int i = 0; i < dlc; i++) rsp->setData(i, (char)0xFF);
+
+    // First byte carries PID of the UCF
     rsp->setData(0, (char)computePID(ucfId));
 
+    // Remaining bytes carry UCF payload (shifted by +1)
     for (auto &sig : signalTable) {
         if (sig.frameId == ucfId) {
             int target = sig.byteOffset + 1;
-            if (target >= 1 && target < 8) {
+            if (target >= 1 && target < dlc) {
                 rsp->setData(target, (char)sig.value);
             }
         }

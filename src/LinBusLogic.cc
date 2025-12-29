@@ -31,15 +31,14 @@ void LinBusLogic::finish() {
 }
 
 double LinBusLogic::headerRemainderTxTime() const {
-    // Sync + PID = 2 bytes; 10 bits/byte (start + 8 data + stop)
-    const int bits = 2 * 10;
+    const int bits = 2 * 10; // Sync + PID, 10 bits each (UART style)
     return (double)bits / baudRate;
 }
 
 double LinBusLogic::responseTxTime(int dataLength) const {
     int n = dataLength;
     if (n < 0) n = 0;
-    if (n > 8) n = 8; // keep model bounded
+    if (n > 8) n = 8;
     const int bytes = n + 1; // + checksum
     const int bits = bytes * 10;
     return (double)bits / baudRate;
@@ -63,7 +62,6 @@ void LinBusLogic::handleMessage(cMessage *msg) {
             EV_INFO << "Bus forwarding signal: " << pendingResponse->getName()
                     << " (" << pendingResponse->getBitLength() << " bits)" << endl;
 
-            // Deliver at end-of-response + propagation
             forwardToAll(pendingResponse, propDelay);
             pendingResponse = nullptr;
         }
@@ -79,23 +77,29 @@ void LinBusLogic::handleMessage(cMessage *msg) {
     // --- 3) Cast to packet ---
     cPacket *frame = check_and_cast<cPacket *>(msg);
 
-    // --- 4) Stamp source address (for echo filtering in nodes) ---
+    // --- 4) Record ingress port index (DO NOT overwrite sender identity) ---
     if (auto brk = dynamic_cast<LinBreakSignal*>(frame)) {
-        brk->setSourceAddr(srcGateIndex);
+        brk->setIngressPortIndex(srcGateIndex);
     } else if (auto hdr = dynamic_cast<LinHeader*>(frame)) {
-        hdr->setSourceAddr(srcGateIndex);
+        hdr->setIngressPortIndex(srcGateIndex);
     } else if (auto rsp = dynamic_cast<LinResponse*>(frame)) {
-        rsp->setSourceAddr(srcGateIndex);
+        rsp->setIngressPortIndex(srcGateIndex);
     }
 
-    // --- 5) Error injection: drop ---
+    // --- 5) Sanity: header/break during active response window (schedule bug) ---
+    if (isResponseOnBus && dynamic_cast<LinResponse*>(frame) == nullptr) {
+        EV_WARN << "Bus received " << frame->getName()
+                << " while response window active (schedule/protocol violation in model)." << endl;
+    }
+
+    // --- 6) Error injection: drop ---
     if (uniform(0, 1) < frameDropRate) {
         EV_WARN << "Bus DROPPING frame: " << frame->getName() << endl;
         delete frame;
         return;
     }
 
-    // --- 6) Error injection: corrupt ---
+    // --- 7) Error injection: corrupt ---
     if (uniform(0, 1) < frameErrorRate) {
         EV_WARN << "Bus CORRUPTING frame: " << frame->getName() << endl;
 
@@ -109,9 +113,10 @@ void LinBusLogic::handleMessage(cMessage *msg) {
         } else if (auto hdr = dynamic_cast<LinHeader*>(frame)) {
             hdr->setPid(hdr->getPid() ^ 0xFF);
         }
+        // Note: break “corruption” is just logged (duration isn’t modified here).
     }
 
-    // --- 7) RESPONSE handling: collision + timed delivery at end-of-response ---
+    // --- 8) RESPONSE handling: collision + timed delivery at end-of-response ---
     if (auto rsp = dynamic_cast<LinResponse*>(frame)) {
 
         if (!isResponseOnBus) {
@@ -120,13 +125,11 @@ void LinBusLogic::handleMessage(cMessage *msg) {
 
             double txDuration = responseTxTime(rsp->getDataLength());
             scheduleAt(simTime() + txDuration, transmissionEndTimer);
-
-            // Do not forward now (receiver sees frame at end-of-response)
             return;
         }
 
-        // Collision: invalidate the response slot
-        EV_WARN << "COLLISION DETECTED on Bus for ID 0x" << std::hex << rsp->getFrameId() << std::dec << endl;
+        EV_WARN << "COLLISION DETECTED on Bus for ID 0x" << std::hex
+                << rsp->getFrameId() << std::dec << endl;
 
         if (pendingResponse) {
             pendingResponse->setCollision(true);
@@ -137,7 +140,7 @@ void LinBusLogic::handleMessage(cMessage *msg) {
         return;
     }
 
-    // --- 8) HEADER handling: timed delivery at end-of-header remainder ---
+    // --- 9) HEADER handling: timed delivery at end-of-header remainder ---
     if (auto hdr = dynamic_cast<LinHeader*>(frame)) {
         EV_INFO << "Bus forwarding signal: " << hdr->getName()
                 << " (" << hdr->getBitLength() << " bits)" << endl;
@@ -147,7 +150,7 @@ void LinBusLogic::handleMessage(cMessage *msg) {
         return;
     }
 
-    // --- 9) BREAK / others: forward with propagation only ---
+    // --- 10) BREAK / others: forward with propagation only ---
     EV_INFO << "Bus forwarding signal: " << frame->getName()
             << " (" << frame->getBitLength() << " bits)" << endl;
 
