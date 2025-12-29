@@ -18,20 +18,18 @@ unsigned char computeChecksum(LinResponse *frame, int pid)
     int len = frame->getDataLength();
     unsigned int sum = 0;
 
-    // Check for Classic Checksum (used for diagnostics 0x3C, 0x3D)
-    // or if the node is configured for LIN 1.x (not modeled here, assuming LIN 2.x)
-    bool classic = (pid == 0x3C || pid == 0x3D);
+    // FIX: Classic checksum selection must be based on the RAW ID (PID contains parity bits).
+    unsigned char rawId = (unsigned char)(pid & 0x3F);
+    bool classic = (rawId == 0x3C || rawId == 0x3D);
 
-    // Enhanced Checksum includes the PID
+    // Enhanced Checksum includes the protected ID (PID)
     if (!classic) {
-        sum += pid;
+        sum += (unsigned char)pid;
     }
 
     // Add Data Bytes
     for (int i = 0; i < len; ++i) {
         sum += (unsigned char)frame->getData(i);
-        // Handle carry immediately or after loop - LIN standard uses inverted modulo 256 with carry
-        // Simple addition loop here, strict carry handling below
     }
 
     // Fold carries (add high byte to low byte)

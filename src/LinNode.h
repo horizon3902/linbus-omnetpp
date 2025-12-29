@@ -4,6 +4,7 @@
 #include <omnetpp.h>
 #include <vector>
 #include <string>
+#include <unordered_map>
 #include "LinDataFrame_m.h"
 
 using namespace omnetpp;
@@ -21,7 +22,6 @@ struct LinSlot {
     int frameId;
     std::string publisher;
     double period;
-    // NEW: ISO Compliance - Track if this slot is for an Event-Triggered Frame
     bool isETF = false;
 };
 
@@ -47,6 +47,7 @@ class LinNode : public cSimpleModule
 {
 private:
     bool isMaster;
+    int nodeAddress;
     LinNodeState state;
 
     // --- TIMERS ---
@@ -54,18 +55,32 @@ private:
     cMessage *headerTimer;
     cMessage *responseTimeoutTimer;
 
-    // Wakeup timers
-    cMessage *wakeupTimer;           // Triggers the initial pulse (simulated external event)
-    cMessage *wakeupExpirationTimer; // Tracks the 150ms timeout waiting for Master header
+    cMessage *wakeupTimer;
+    cMessage *wakeupExpirationTimer;
+
+    // Milestone 1: master must be able to enter sleep even if it ignores echo
+    cMessage *goToSleepTimer;
+
+    // Milestone 2: event generation / re-arm timer
+    cMessage *eventRearmTimer;
+
+    // Milestone 3: inactivity sleep timer
+    cMessage *inactivityTimer;
+    double inactivitySleepTime = 4.0;
 
     int pendingResponseFrameId = -1;
-
-    // Flag to pause/resume master schedule during sleep
     bool scheduleRunning = true;
 
+    // --- RX QUALIFICATION (FIX) ---
+    // For non-master nodes: accept a response only if a valid header was received,
+    // and (optionally) only if a BREAK was seen before that header.
+    bool rxSawBreak = false;
+    bool rxAwaitingResponse = false;
+    int  rxExpectedResponseId = -1;
+
     // --- WAKEUP LOGIC STATE ---
-    int wakeupRetryCount = 0; // ISO allows 3 retries
-    bool pendingWakeup = false; // True if we sent a pulse and are waiting for header
+    int wakeupRetryCount = 0;
+    bool pendingWakeup = false;
 
     // --- PHY PARAMETERS ---
     double baudRate;
@@ -76,36 +91,71 @@ private:
     std::vector<LinSlot> scheduleTable;
     int currentSlotIndex = 0;
 
-    // Collision Resolution Schedule
     std::vector<LinSlot> collisionScheduleTable;
     bool resolvingCollision = false;
     int collisionSlotIndex = 0;
+
+    // Latch slot used by headerTimer
+    LinSlot pendingHeaderSlot;
+    bool pendingHeaderValid = false;
+    bool endResolveAfterHeader = false;
 
     // --- SIGNALS & ERROR MAPPING ---
     std::vector<LinSignal> signalTable;
     std::vector<LinErrorSignalBinding> errorBindings;
     LinErrorState errorState;
 
+    // --- MILESTONE 2: ETF MAP + EVENT FLAGS ---
+    std::unordered_map<int, std::vector<int>> etfToUcfs;
+    std::unordered_map<int, bool> ucfEventPending;
+
+    double eventRearmPeriod = -1;
+    double eventProbability = 1.0;
+
     // --- HELPERS ---
     void parseSchedule(const char* config, std::vector<LinSlot>& table);
     void parseSignals(const char* config);
     void parseErrorSignals(const char* config);
 
+    // Milestone 2
+    void parseEventFrames(const char* config);
+    void initializeEventFlags();
+    bool isEventFrameId(int etfId) const;
+    bool selectUcfForEventFrame(int etfId, int& outUcfId) const;
+    void setEventPending(int ucfId, bool pending);
+
+    // Milestone 3
+    void resetInactivityTimer();
+    void enterSleep(const char *reason);
+
+    // FIX
+    void resetRxContext();
+
     bool isPublisherFor(int frameId);
-    void applyErrorBits(int frameId, LinResponse *rsp);
+    void applyErrorBits(int logicalFrameId, LinResponse *rsp, int payloadBase);
+
+    bool isGoToSleepCommand(const LinResponse *rsp) const;
+
+    // Timing helpers
+    double headerRemainderTxTime() const;
+    double responseTxTime(int dataLength) const;
 
     // --- PROTOCOL ACTIONS ---
     void sendBreakSignal();
     void sendWakeupPulse();
     void sendHeaderRemainder(int frameId, std::string publisher);
+
     void sendResponse(int frameId, double initialDelay);
+    void sendEventResponse(int etfId, int ucfId, double initialDelay);
+
     void processReceivedHeader(LinHeader *header);
 
-    // Trigger switch to collision resolution table
     void startCollisionResolution();
-
-    // Check if a received break is long enough to be a Wakeup
     bool isWakeupPulse(LinBreakSignal *brk);
+
+    bool isEchoFromSelf(int sourceAddr) const {
+        return (nodeAddress >= 0 && sourceAddr == nodeAddress);
+    }
 
 protected:
     virtual void initialize() override;

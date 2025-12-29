@@ -1,48 +1,101 @@
 #include "LinBusLogic.h"
-#include "LinDataFrame_m.h" // Needed to cast to specific types
+#include "LinDataFrame_m.h"
 #include <omnetpp.h>
 
 Define_Module(LinBusLogic);
 
 void LinBusLogic::initialize() {
-    EV_INFO << "LIN bus initialized (Physical Layer Forwarder)" << endl;
+    EV_INFO << "LIN bus initialized (Timed forwarder + collision model)" << endl;
 
-    // 1. Read Timing Parameters (used for collision duration calc)
     baudRate = par("baudRate");
     propDelay = par("propDelay");
     interByteTime = par("interByteTime");
 
-    // 2. Read Error Injection Parameters (Phase 1)
     frameErrorRate = par("frameErrorRate");
-    frameDropRate = par("frameDropRate");
+    frameDropRate  = par("frameDropRate");
 
-    // 3. NEW (Phase 2): Collision Tracking Init
     isResponseOnBus = false;
     transmissionEndTimer = new cMessage("txEnd");
+
+    pendingResponse = nullptr;
+}
+
+void LinBusLogic::finish() {
+    cancelAndDelete(transmissionEndTimer);
+    transmissionEndTimer = nullptr;
+
+    if (pendingResponse) {
+        delete pendingResponse;
+        pendingResponse = nullptr;
+    }
+}
+
+double LinBusLogic::headerRemainderTxTime() const {
+    // Sync + PID = 2 bytes; 10 bits/byte (start + 8 data + stop)
+    const int bits = 2 * 10;
+    return (double)bits / baudRate;
+}
+
+double LinBusLogic::responseTxTime(int dataLength) const {
+    int n = dataLength;
+    if (n < 0) n = 0;
+    if (n > 8) n = 8; // keep model bounded
+    const int bytes = n + 1; // + checksum
+    const int bits = bytes * 10;
+    return (double)bits / baudRate;
+}
+
+void LinBusLogic::forwardToAll(cPacket *frame, simtime_t extraDelay) {
+    int gateCount = gateSize("gate$o");
+    for (int i = 0; i < gateCount; i++) {
+        cPacket *out = (i == gateCount - 1) ? frame : frame->dup();
+        sendDelayed(out, extraDelay, "gate$o", i);
+    }
 }
 
 void LinBusLogic::handleMessage(cMessage *msg) {
-    // --- 1. HANDLE SELF-MESSAGES (Collision Timer) ---
-    // If this is our own timer saying "The previous frame finished", reset the busy flag.
+    // --- 1) SELF-MESSAGE: end of response window ---
     if (msg == transmissionEndTimer) {
-        EV_DETAIL << "Bus: Transmission ended. Bus is now free." << endl;
+        EV_DETAIL << "Bus: Response window ended. Bus is now free." << endl;
         isResponseOnBus = false;
-        return; // It's a self-message, not a frame to forward
+
+        if (pendingResponse) {
+            EV_INFO << "Bus forwarding signal: " << pendingResponse->getName()
+                    << " (" << pendingResponse->getBitLength() << " bits)" << endl;
+
+            // Deliver at end-of-response + propagation
+            forwardToAll(pendingResponse, propDelay);
+            pendingResponse = nullptr;
+        }
+        return;
     }
 
-    // --- 2. CAST TO PACKET ---
+    // --- 2) Determine which port injected the signal ---
+    int srcGateIndex = -1;
+    if (msg->getArrivalGate() != nullptr) {
+        srcGateIndex = msg->getArrivalGate()->getIndex();
+    }
+
+    // --- 3) Cast to packet ---
     cPacket *frame = check_and_cast<cPacket *>(msg);
 
-    // --- 3. ERROR INJECTION LOGIC (Phase 1 - Retained) ---
+    // --- 4) Stamp source address (for echo filtering in nodes) ---
+    if (auto brk = dynamic_cast<LinBreakSignal*>(frame)) {
+        brk->setSourceAddr(srcGateIndex);
+    } else if (auto hdr = dynamic_cast<LinHeader*>(frame)) {
+        hdr->setSourceAddr(srcGateIndex);
+    } else if (auto rsp = dynamic_cast<LinResponse*>(frame)) {
+        rsp->setSourceAddr(srcGateIndex);
+    }
 
-    // A. Frame Drop
+    // --- 5) Error injection: drop ---
     if (uniform(0, 1) < frameDropRate) {
         EV_WARN << "Bus DROPPING frame: " << frame->getName() << endl;
         delete frame;
         return;
     }
 
-    // B. Frame Corruption
+    // --- 6) Error injection: corrupt ---
     if (uniform(0, 1) < frameErrorRate) {
         EV_WARN << "Bus CORRUPTING frame: " << frame->getName() << endl;
 
@@ -51,49 +104,52 @@ void LinBusLogic::handleMessage(cMessage *msg) {
             if (len > 0) {
                 int idx = intuniform(0, len - 1);
                 char oldVal = rsp->getData(idx);
-                rsp->setData(idx, oldVal ^ 0xFF); // Flip bits
+                rsp->setData(idx, oldVal ^ 0xFF);
             }
         } else if (auto hdr = dynamic_cast<LinHeader*>(frame)) {
-            hdr->setPid(hdr->getPid() ^ 0xFF); // Flip PID
+            hdr->setPid(hdr->getPid() ^ 0xFF);
         }
     }
 
-    // --- 4. NEW (Phase 2): COLLISION DETECTION ---
+    // --- 7) RESPONSE handling: collision + timed delivery at end-of-response ---
+    if (auto rsp = dynamic_cast<LinResponse*>(frame)) {
 
-    // We only care about collisions for RESPONSES (multiple slaves replying to one header)
-    if (LinResponse *rsp = dynamic_cast<LinResponse*>(frame)) {
-
-        if (isResponseOnBus) {
-            // Case A: Bus is already busy with another response -> COLLISION!
-            EV_WARN << "COLLISION DETECTED on Bus for ID 0x" << std::hex << rsp->getFrameId() << std::dec << endl;
-
-            // Mark this frame as collided.
-            // In reality, BOTH frames get corrupted.
-            // In simulation, marking the second one is enough for the Master to see "Collision".
-            rsp->setCollision(true);
-            rsp->setName("LIN_COLLISION");
-
-        } else {
-            // Case B: Bus is free -> Start tracking this transmission
+        if (!isResponseOnBus) {
             isResponseOnBus = true;
+            pendingResponse = rsp;
 
-            // Calculate how long this frame occupies the bus
-            // Formula: (DataBytes + Checksum) * 10 bits/byte (Start + 8 Data + Stop)
-            int totalBits = (rsp->getDataLength() + 1) * 10;
-            double txDuration = (double)totalBits / baudRate;
-
-            // Schedule the "Free the bus" timer
+            double txDuration = responseTxTime(rsp->getDataLength());
             scheduleAt(simTime() + txDuration, transmissionEndTimer);
+
+            // Do not forward now (receiver sees frame at end-of-response)
+            return;
         }
+
+        // Collision: invalidate the response slot
+        EV_WARN << "COLLISION DETECTED on Bus for ID 0x" << std::hex << rsp->getFrameId() << std::dec << endl;
+
+        if (pendingResponse) {
+            pendingResponse->setCollision(true);
+            pendingResponse->setName("LIN_COLLISION");
+        }
+
+        delete rsp;
+        return;
     }
 
-    // --- 5. FORWARDING (Retained) ---
+    // --- 8) HEADER handling: timed delivery at end-of-header remainder ---
+    if (auto hdr = dynamic_cast<LinHeader*>(frame)) {
+        EV_INFO << "Bus forwarding signal: " << hdr->getName()
+                << " (" << hdr->getBitLength() << " bits)" << endl;
+
+        double tx = headerRemainderTxTime();
+        forwardToAll(hdr, tx + propDelay);
+        return;
+    }
+
+    // --- 9) BREAK / others: forward with propagation only ---
     EV_INFO << "Bus forwarding signal: " << frame->getName()
             << " (" << frame->getBitLength() << " bits)" << endl;
 
-    int gateCount = gateSize("gate$o");
-    for (int i = 0; i < gateCount; i++) {
-        // Standard OMNeT++ idiom: dup() for N-1 ports, send original to last port
-        send(i == gateCount - 1 ? frame : frame->dup(), "gate$o", i);
-    }
+    forwardToAll(frame, propDelay);
 }

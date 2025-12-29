@@ -4,23 +4,25 @@ simple LinNode
 {
     parameters:
         bool isMaster = default(false);
-        
-        // --- SCHEDULE CONFIGURATION (MASTER ONLY) ---
-        // 1. Normal Schedule: "ID:PublisherName:Period; ..."
-        // To mark an Event-Triggered Frame (ETF), use the suffix (E) for the publisher.
-        // Example: "10:Master:0.01; 20:Slave1(E):0.02"
-        string scheduleConfiguration = default(""); 
 
-        // 2. Collision Resolution Schedule
-        // This schedule is executed ONLY when a collision is detected on an ETF.
-        // It typically polls the associated unconditional frames one by one.
+        // Unique node address used for echo filtering.
+        // Convention used by LinNetwork.ned:
+        // master = 0, slaves[i] = i+1
+        int nodeAddress = default(-1);
+
+        // --- SCHEDULE CONFIGURATION (MASTER ONLY) ---
+        string scheduleConfiguration = default("");
         string collisionScheduleConfiguration = default("");
 
-        // --- SIGNAL CONFIGURATION (ALL NODES) ---
-        // Defines the static data values a node publishes
-        string signalConfiguration = default("");
+        // --- MILESTONE 2: EVENT-TRIGGERED FRAME (ETF) CONFIG ---
+        // Format (hex IDs, ';' separated):
+        //   "20:21,22;30:31,32"
+        string eventFrameConfiguration = default("");
+        double eventRearmPeriod @unit(s) = default(-1s);
+        double eventProbability = default(1.0);
 
-        // Defines where the Response_Error bit is located
+        // --- SIGNAL CONFIGURATION (ALL NODES) ---
+        string signalConfiguration = default("");
         string errorSignalConfiguration = default("");
 
         // --- PHY LAYER PARAMETERS ---
@@ -29,9 +31,12 @@ simple LinNode
         double interByteTime @unit(s) = default(0.0001s);
 
         // --- WAKEUP TEST PARAMETER ---
-        // Time at which this node initiates a wakeup pulse. 
-        // Set to -1s to disable.
         double wakeupTime @unit(s) = default(-1s);
+
+        // --- MILESTONE 3: INACTIVITY-BASED SLEEP ---
+        // If >= 0: node enters SLEEP if it sees no bus activity for this duration.
+        // Set small (e.g., 0.2s) for demos; LIN commonly uses ~4s inactivity sleep. [web:10]
+        double inactivitySleepTime @unit(s) = default(4s);
 
     gates:
         inout gate;
