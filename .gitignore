@@ -49,3 +49,4 @@ linbus_rel
 .project
 .cproject
 
+.env
