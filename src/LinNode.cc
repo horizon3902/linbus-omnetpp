@@ -1,5 +1,6 @@
 #include "LinNode.h"
 #include "LinUtil.h"
+
 #include <stdlib.h>
 
 Define_Module(LinNode);
@@ -23,7 +24,7 @@ void LinNode::initialize() {
     // --------------------
     // Diagnostics (Phase 2)
     // --------------------
-    diagCtx.enabled = false;
+    diagCtx.enabled = par("enableDiagnostics").boolValue();;
     diagCtx.role = DIAG_NONE;
     diagCtx.tpState = DIAG_TP_IDLE;
     diagCtx.rxBuffer.clear();
@@ -322,7 +323,11 @@ void LinNode::handleMessage(cMessage *msg) {
 
         sendHeaderRemainder(slot.frameId, slot.publisher);
 
-        if (isMaster && !slot.isETF && !isPublisherFor(slot.frameId)) {
+        if (isMaster &&
+            !slot.isETF &&
+            !isPublisherFor(slot.frameId) &&
+            !isDiagnosticFrame(slot.frameId)) {
+
             pendingResponseFrameId = slot.frameId;
 
             double timeout =
@@ -334,6 +339,7 @@ void LinNode::handleMessage(cMessage *msg) {
             cancelEvent(responseTimeoutTimer);
             scheduleAt(simTime() + timeout, responseTimeoutTimer);
         }
+
 
         if (endResolveAfterHeader) {
             resolvingCollision = false;
@@ -446,6 +452,14 @@ void LinNode::handleMessage(cMessage *msg) {
     // --------------------
     if (auto header = dynamic_cast<LinHeader*>(msg)) {
         if (isEchoFromSelf(header->getSourceAddr())) { delete msg; return; }
+        // --------------------
+        // DIAGNOSTIC HEADER INTERCEPT
+        // --------------------
+        if (isDiagnosticFrame(header->getFrameId())) {
+            handleDiagnosticHeader(header);
+            delete msg;
+            return;
+        }
 
         if (pendingWakeup) {
             pendingWakeup = false;
@@ -483,20 +497,6 @@ void LinNode::handleMessage(cMessage *msg) {
     if (auto rsp = dynamic_cast<LinResponse*>(msg)) {
         if (isEchoFromSelf(rsp->getSourceAddr())) { delete msg; return; }
 
-        if (!isMaster) {
-            if (!rxAwaitingResponse || rsp->getFrameId() != rxExpectedResponseId) {
-                delete msg;
-                return;
-            }
-            rxAwaitingResponse = false;
-            rxExpectedResponseId = -1;
-        }
-
-        if (isMaster && rsp->getFrameId() == pendingResponseFrameId) {
-            cancelEvent(responseTimeoutTimer);
-            pendingResponseFrameId = -1;
-        }
-
         unsigned char expected =
             computeChecksum(rsp, computePID(rsp->getFrameId()));
 
@@ -513,12 +513,41 @@ void LinNode::handleMessage(cMessage *msg) {
                     startCollisionResolution();
                 }
             }
-        } else {
-            if (rsp->getFrameId() == 0x3C &&
-                rsp->getDataLength() > 0 &&
-                (unsigned char)rsp->getData(0) == 0x00) {
-                enterSleep("received go-to-sleep");
+
+            delete msg;
+            return;
+        }
+
+        // --------------------
+        // DIAGNOSTIC RESPONSE
+        // --------------------
+        if (isDiagnosticFrame(rsp->getFrameId())) {
+            handleDiagnosticResponse(rsp);
+            delete msg;
+            return;
+        }
+
+        // --------------------
+        // NORMAL RESPONSE
+        // --------------------
+        if (!isMaster) {
+            if (!rxAwaitingResponse || rsp->getFrameId() != rxExpectedResponseId) {
+                delete msg;
+                return;
             }
+            rxAwaitingResponse = false;
+            rxExpectedResponseId = -1;
+        }
+
+        if (isMaster && rsp->getFrameId() == pendingResponseFrameId) {
+            cancelEvent(responseTimeoutTimer);
+            pendingResponseFrameId = -1;
+        }
+
+        if (rsp->getFrameId() == 0x3C &&
+            rsp->getDataLength() > 0 &&
+            (unsigned char)rsp->getData(0) == 0x00) {
+            enterSleep("received go-to-sleep");
         }
 
         if (state != SLEEP) state = IDLE;
@@ -526,8 +555,15 @@ void LinNode::handleMessage(cMessage *msg) {
         return;
     }
 
+
     delete msg;
 }
+
+bool LinNode::isDiagnosticFrame(int frameId) const {
+    return frameId == LIN_DIAG_MASTER_REQUEST_ID ||
+           frameId == LIN_DIAG_SLAVE_RESPONSE_ID;
+}
+
 
 
 // --- HELPERS ---
@@ -631,9 +667,10 @@ void LinNode::sendBreakSignal() {
     resetInactivityTimer();
 }
 
-void LinNode::sendHeaderRemainder(int frameId, std::string publisher) {
+void LinNode::sendHeaderRemainder(int frameId, std::string publisher)
+{
     LinHeader *header = new LinHeader("LIN_Header");
-    header->setSourceAddr(nodeAddress); // true node identity
+    header->setSourceAddr(nodeAddress);
     header->setIngressPortIndex(-1);
     header->setFrameId(frameId);
     header->setPid(computePID(frameId));
@@ -642,11 +679,44 @@ void LinNode::sendHeaderRemainder(int frameId, std::string publisher) {
     send(header, "gate$o");
     resetInactivityTimer();
 
+    // =================================================
+    // FIX 7: MASTER diagnostic request transmission
+    // =================================================
+    if (isMaster &&
+        diagCtx.enabled &&
+        frameId == LIN_DIAG_MASTER_REQUEST_ID)
+    {
+        EV_INFO << "[DIAG] Master sending diagnostic REQUEST payload\n";
+
+        LinResponse *rsp = new LinResponse("LIN_DiagMasterRequest");
+        rsp->setSourceAddr(nodeAddress);
+        rsp->setIngressPortIndex(-1);
+        rsp->setFrameId(LIN_DIAG_MASTER_REQUEST_ID);
+
+        // ---- Single Frame diagnostic request ----
+        rsp->setDataLength(3);
+        rsp->setData(0, 0x02);                 // SF, length = 2
+        rsp->setData(1, LIN_DIAG_NAD_BROADCAST); // NAD
+        rsp->setData(2, 0x10);                 // SID: Diagnostic Session Control
+
+        rsp->setChecksum(
+            computeChecksum(rsp, computePID(LIN_DIAG_MASTER_REQUEST_ID))
+        );
+
+        sendDelayed(rsp, interByteTime, "gate$o");
+        state = TRANSMITTING;
+        return;
+    }
+
+    // =================================================
+    // NORMAL (non-diagnostic) publisher behavior
+    // =================================================
     if (!isEventFrameId(frameId) && isPublisherFor(frameId)) {
         double delay = headerRemainderTxTime() + interByteTime;
         sendResponse(frameId, delay);
     }
 }
+
 
 void LinNode::processReceivedHeader(LinHeader *header) {
     state = WAIT_FOR_PID;
@@ -671,6 +741,157 @@ void LinNode::processReceivedHeader(LinHeader *header) {
         state = RECEIVING;
     }
 }
+
+void LinNode::handleDiagnosticHeader(LinHeader *header)
+{
+    int frameId = header->getFrameId();
+
+    EV_INFO << "[DIAG] Diagnostic header received. ID=0x"
+            << std::hex << frameId << std::dec << endl;
+
+    // BREAK qualification (slaves only)
+    if (!isMaster) {
+        if (!rxSawBreak) {
+            EV_WARN << "[DIAG] Ignoring diagnostic header without BREAK\n";
+            return;
+        }
+        rxSawBreak = false;
+    }
+
+    // Header does NOT change TX/RX state
+    diagCtx.rxBuffer.clear();
+    diagCtx.tpState = DIAG_TP_RX_IN_PROGRESS;
+
+    // Master Request Header (0x3C)
+    if (frameId == LIN_DIAG_MASTER_REQUEST_ID) {
+        if (!isMaster) {
+            EV_INFO << "[DIAG] Slave awaiting diagnostic request payload\n";
+        }
+        return;
+    }
+
+    // Slave Response Header (0x3D)
+    if (frameId == LIN_DIAG_SLAVE_RESPONSE_ID) {
+        if (isMaster) {
+            EV_INFO << "[DIAG] Master awaiting diagnostic response payload\n";
+        }
+        return;
+    }
+
+    EV_WARN << "[DIAG] Unknown diagnostic frame ID\n";
+    diagCtx.tpState = DIAG_TP_IDLE;
+}
+
+
+void LinNode::handleDiagnosticResponse(LinResponse *rsp)
+{
+    EV_INFO << "[DIAG] Diagnostic response received (ID=0x"
+            << std::hex << rsp->getFrameId() << std::dec << ")\n";
+
+    // ----------------------------------------
+    // Only slaves react to diagnostic requests
+    // ----------------------------------------
+    if (isMaster) {
+        EV_INFO << "[DIAG] Master received diagnostic response payload\n";
+        return;
+    }
+
+
+    // ----------------------------------------
+    // Only MASTER REQUEST (0x3C) triggers slave TX
+    // ----------------------------------------
+    if (rsp->getFrameId() != LIN_DIAG_MASTER_REQUEST_ID) {
+        return;
+    }
+
+    int dlc = rsp->getDataLength();
+    if (dlc < 3) {
+        EV_WARN << "[DIAG] Invalid diagnostic request length\n";
+        diagCtx.tpState = DIAG_TP_IDLE;
+        state = IDLE;
+        return;
+    }
+
+    uint8_t pci = (uint8_t)rsp->getData(0);
+    uint8_t frameType = (pci >> 4) & 0x0F;
+
+    // ----------------------------------------
+    // Only SINGLE FRAME supported for now
+    // ----------------------------------------
+    if (frameType != 0x0) {
+        EV_WARN << "[DIAG] Unsupported diagnostic request frame type="
+                << (int)frameType << endl;
+        diagCtx.tpState = DIAG_TP_IDLE;
+        state = IDLE;
+        return;
+    }
+
+    uint8_t payloadLen = pci & 0x0F;
+    if (payloadLen < 2) {
+        EV_WARN << "[DIAG] Diagnostic SF payload too short\n";
+        diagCtx.tpState = DIAG_TP_IDLE;
+        state = IDLE;
+        return;
+    }
+
+    uint8_t nad = (uint8_t)rsp->getData(1);
+    uint8_t sid = (uint8_t)rsp->getData(2);
+
+    EV_INFO << "[DIAG] Diagnostic REQUEST received: NAD=0x"
+            << std::hex << (int)nad
+            << " SID=0x" << (int)sid << std::dec << endl;
+
+    // ----------------------------------------
+    // SPEC-ACCURATE NAD + SID HANDLING
+    // ----------------------------------------
+
+    bool addressedToMe = (nad == (uint8_t)nodeAddress);
+    bool isBroadcast   = (nad == LIN_DIAG_NAD_BROADCAST);
+
+    // Only specific SIDs allow broadcast responses (none implemented yet)
+    bool broadcastResponseAllowed = false;
+
+    // ISO 17987: SID 0x10 (Diagnostic Session Control) MUST NOT
+    // generate slave responses for broadcast NAD.
+    if (!addressedToMe) {
+        if (!(isBroadcast && broadcastResponseAllowed)) {
+            EV_INFO << "[DIAG] No response permitted for this NAD/SID\n";
+            diagCtx.tpState = DIAG_TP_IDLE;
+            state = IDLE;
+            return;
+        }
+    }
+
+
+    // ----------------------------------------
+    // Build SLAVE RESPONSE (0x3D)
+    // ----------------------------------------
+    diagCtx.tpState = DIAG_TP_TX_IN_PROGRESS;
+    LinResponse *resp = new LinResponse("LIN_DiagSlaveResponse");
+    resp->setSourceAddr(nodeAddress);
+    resp->setIngressPortIndex(-1);
+    resp->setFrameId(LIN_DIAG_SLAVE_RESPONSE_ID);
+
+    // Single Frame response: PCI + NAD + SID(+0x40)
+    resp->setDataLength(3);
+    resp->setData(0, 0x02);          // SF, length=2
+    resp->setData(1, nad);           // Echo NAD
+    resp->setData(2, sid + 0x40);    // Positive response SID
+
+    resp->setChecksum(
+        computeChecksum(resp, computePID(LIN_DIAG_SLAVE_RESPONSE_ID))
+    );
+
+    EV_INFO << "[DIAG] Slave sending diagnostic RESPONSE (0x3D)\n";
+
+    sendDelayed(resp, interByteTime, "gate$o");
+    state = TRANSMITTING;
+
+    // TX is now scheduled; TP transaction complete for SF
+    diagCtx.tpState = DIAG_TP_IDLE;
+}
+
+
 
 void LinNode::applyErrorBits(int logicalFrameId, LinResponse *rsp, int payloadBase) {
     bool hasError = errorState.lastChecksumError || errorState.lastHeaderError || errorState.lastTimeoutError;

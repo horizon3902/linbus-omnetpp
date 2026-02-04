@@ -7,6 +7,10 @@
 #include <unordered_map>
 #include <cstdint>
 #include "LinDataFrame_m.h"
+#include "LinDiag.h"
+#include "LinDiagDefs.h"
+
+
 
 using namespace omnetpp;
 
@@ -27,52 +31,6 @@ enum LinNodeState {
  * Phase 1: Infrastructure only.
  * No behavioral impact yet.
  */
-
-// Diagnostic frame IDs (RAW IDs, parity added later)
-constexpr int LIN_DIAG_MASTER_REQUEST_ID = 0x3C;
-constexpr int LIN_DIAG_SLAVE_RESPONSE_ID = 0x3D;
-
-// Diagnostic node role (logical, not a node type)
-enum LinDiagRole {
-    DIAG_NONE,     // diagnostics disabled
-    DIAG_MASTER,  // diagnostic tester
-    DIAG_SLAVE    // diagnostic responder
-};
-
-// Diagnostic transport protocol state
-enum LinDiagTpState {
-    DIAG_TP_IDLE,
-    DIAG_TP_RX_IN_PROGRESS,
-    DIAG_TP_TX_IN_PROGRESS,
-    DIAG_TP_WAIT_FC
-};
-
-// Diagnostic transport context (per node)
-struct LinDiagContext {
-    bool enabled = false;
-    LinDiagRole role = DIAG_NONE;
-
-    LinDiagTpState tpState = DIAG_TP_IDLE;
-
-    // Transport protocol sequencing
-    uint8_t expectedSeq = 0;
-    uint8_t nextTxSeq = 0;
-
-    // Reassembly buffer for RX
-    std::vector<uint8_t> rxBuffer;
-    uint16_t expectedLength = 0;
-
-    // Pending TX payload (multi-frame)
-    std::vector<uint8_t> txBuffer;
-    uint16_t txOffset = 0;
-
-    // Addressing (NAD / logical address)
-    uint8_t targetAddress = 0xFF;   // 0x7F = broadcast in LIN diag
-    uint8_t sourceAddress = 0x00;
-
-    // Timeout handling
-    simtime_t lastActivity;
-};
 
 /*
  * =========================
@@ -112,6 +70,7 @@ private:
     int nodeAddress;
     LinNodeState state;
 
+
     // =========================
     // DIAGNOSTICS (INACTIVE)
     // =========================
@@ -134,6 +93,14 @@ private:
 
     int pendingResponseFrameId = -1;
     bool scheduleRunning = true;
+    // =========================
+    // DIAGNOSTICS – PHASE 2
+    // =========================
+    bool isDiagnosticFrame(int frameId) const;
+
+    void handleDiagnosticHeader(LinHeader *header);
+    void handleDiagnosticResponse(LinResponse *rsp);
+
 
     // --- RX QUALIFICATION ---
     bool rxSawBreak = false;
@@ -227,6 +194,7 @@ private:
     bool isEchoFromSelf(int sourceAddr) const {
         return (nodeAddress >= 0 && sourceAddr == nodeAddress);
     }
+
 
 protected:
     virtual void initialize() override;

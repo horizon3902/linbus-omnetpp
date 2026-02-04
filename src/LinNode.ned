@@ -4,6 +4,7 @@ simple LinNode
 {
     parameters:
         bool isMaster = default(false);
+        bool enableDiagnostics = default(false);
 
         int nodeAddress = default(-1);
 
