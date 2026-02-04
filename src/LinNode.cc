@@ -20,6 +20,23 @@ void LinNode::initialize() {
     state = IDLE;
     scheduleRunning = true;
 
+    // --------------------
+    // Diagnostics (Phase 2)
+    // --------------------
+    diagCtx.enabled = false;
+    diagCtx.role = DIAG_NONE;
+    diagCtx.tpState = DIAG_TP_IDLE;
+    diagCtx.rxBuffer.clear();
+    diagCtx.txBuffer.clear();
+
+    if (isMaster) {
+        diagCtx.role = DIAG_MASTER;
+    } else {
+        diagCtx.role = DIAG_SLAVE;
+    }
+
+    // --------------------
+
     scheduleTimer = new cMessage("scheduleTimer");
     headerTimer = new cMessage("headerTimer");
     responseTimeoutTimer = new cMessage("responseTimeoutTimer");
@@ -238,33 +255,110 @@ void LinNode::enterSleep(const char *reason) {
 // -----------------------------------------------------
 
 void LinNode::handleMessage(cMessage *msg) {
-    // inactivity => sleep
+
+    // --------------------
+    // INACTIVITY → SLEEP
+    // --------------------
     if (msg == inactivityTimer) {
         enterSleep("inactivity timeout");
         return;
     }
 
-    // periodic event re-arm
+    // --------------------
+    // EVENT RE-ARM
+    // --------------------
     if (msg == eventRearmTimer) {
         for (auto &kv : ucfEventPending) {
-            bool setIt = (uniform(0, 1) < eventProbability);
-            kv.second = setIt;
+            kv.second = (uniform(0, 1) < eventProbability);
         }
         scheduleAt(simTime() + eventRearmPeriod, eventRearmTimer);
         return;
     }
 
-    // master-local sleep completion
+    // --------------------
+    // GO-TO-SLEEP (MASTER LOCAL)
+    // --------------------
     if (msg == goToSleepTimer) {
         EV_WARN << "GO-TO-SLEEP (local) completed.\n";
         enterSleep("go-to-sleep completed");
         return;
     }
 
-    // --- wakeup logic ---
+    // --------------------
+    // MASTER SCHEDULE
+    // --------------------
+    if (msg == scheduleTimer) {
+        if (!scheduleRunning) return;
+
+        std::vector<LinSlot> *activeTable =
+            resolvingCollision ? &collisionScheduleTable : &scheduleTable;
+        int *idx = resolvingCollision ? &collisionSlotIndex : &currentSlotIndex;
+
+        if (activeTable->empty()) return;
+
+        LinSlot &slot = (*activeTable)[*idx];
+
+        pendingHeaderSlot = slot;
+        pendingHeaderValid = true;
+        endResolveAfterHeader =
+            resolvingCollision && (*idx == (int)collisionScheduleTable.size() - 1);
+
+        sendBreakSignal();
+
+        double tBreak = (double)breakBits / baudRate;
+        double tDelim = (double)delimiterBits / baudRate;
+        scheduleAt(simTime() + tBreak + tDelim + interByteTime, headerTimer);
+        scheduleAt(simTime() + slot.period, scheduleTimer);
+
+        *idx = (*idx + 1) % activeTable->size();
+        return;
+    }
+
+    if (msg == headerTimer) {
+        if (!pendingHeaderValid) return;
+
+        LinSlot slot = pendingHeaderSlot;
+        pendingHeaderValid = false;
+
+        sendHeaderRemainder(slot.frameId, slot.publisher);
+
+        if (isMaster && !slot.isETF && !isPublisherFor(slot.frameId)) {
+            pendingResponseFrameId = slot.frameId;
+
+            double timeout =
+                1.4 * headerRemainderTxTime() +
+                interByteTime +
+                1.4 * responseTxTime(dlcForFrame(slot.frameId)) +
+                2.0 * propDelay;
+
+            cancelEvent(responseTimeoutTimer);
+            scheduleAt(simTime() + timeout, responseTimeoutTimer);
+        }
+
+        if (endResolveAfterHeader) {
+            resolvingCollision = false;
+            collisionSlotIndex = 0;
+            endResolveAfterHeader = false;
+        }
+        return;
+    }
+
+    if (msg == responseTimeoutTimer) {
+        if (pendingResponseFrameId != -1) {
+            errorState.lastTimeoutError = true;
+            pendingResponseFrameId = -1;
+        }
+        return;
+    }
+
+    // --------------------
+    // WAKEUP LOGIC
+    // --------------------
     if (msg == wakeupTimer) {
         if (state == SLEEP || state == IDLE) {
-            EV_WARN << "Initiating Wakeup Request (Attempt " << wakeupRetryCount + 1 << ").\n";
+            EV_WARN << "Initiating Wakeup Request (Attempt "
+                    << wakeupRetryCount + 1 << ").\n";
+
             sendWakeupPulse();
 
             if (state == SLEEP) {
@@ -283,108 +377,29 @@ void LinNode::handleMessage(cMessage *msg) {
     }
 
     if (msg == wakeupExpirationTimer) {
-        if ((state == SLEEP || pendingWakeup) && pendingWakeup) {
+        if (pendingWakeup) {
             if (wakeupRetryCount < 2) {
-                 EV_WARN << "Wakeup Timeout! No Header from Master. Retrying...\n";
-                 wakeupRetryCount++;
-                 scheduleAt(simTime() + 0.01, wakeupTimer);
+                EV_WARN << "Wakeup Timeout! No Header from Master. Retrying...\n";
+                wakeupRetryCount++;
+                scheduleAt(simTime() + 0.01, wakeupTimer);
             } else {
-                 EV_ERROR << "Wakeup Failed after 3 attempts. Backing off.\n";
-                 wakeupRetryCount = 0;
-                 pendingWakeup = false;
+                EV_ERROR << "Wakeup Failed after 3 attempts. Backing off.\n";
+                wakeupRetryCount = 0;
+                pendingWakeup = false;
             }
         }
         return;
     }
 
-    // --- master schedule ---
-    if (msg == scheduleTimer) {
-        if (!scheduleRunning) {
-            EV_DETAIL << "Master is in Sleep Mode. Schedule paused.\n";
-            return;
-        }
-
-        std::vector<LinSlot> *activeTable = resolvingCollision ? &collisionScheduleTable : &scheduleTable;
-        int *idx = resolvingCollision ? &collisionSlotIndex : &currentSlotIndex;
-        if (activeTable->empty()) return;
-
-        LinSlot &slot = (*activeTable)[*idx];
-
-        EV_INFO << ">>> Starting Slot for Frame ID 0x" << std::hex << slot.frameId << std::dec
-                << (resolvingCollision ? " [RESOLVING]" : "")
-                << (slot.isETF ? " (ETF)" : "") << endl;
-
-        pendingHeaderSlot = slot;
-        pendingHeaderValid = true;
-
-        endResolveAfterHeader = (resolvingCollision && (*idx == (int)collisionScheduleTable.size() - 1));
-
-        sendBreakSignal();
-        resetInactivityTimer();
-
-        double tBreak = (double)breakBits / baudRate;
-        double tDelim = (double)delimiterBits / baudRate;
-        scheduleAt(simTime() + tBreak + tDelim + interByteTime, headerTimer);
-
-        scheduleAt(simTime() + slot.period, scheduleTimer);
-
-        *idx = (*idx + 1) % activeTable->size();
-        return;
-    }
-
-    if (msg == headerTimer) {
-        if (!pendingHeaderValid) {
-            EV_WARN << "headerTimer fired without a pending slot. Ignoring.\n";
-            return;
-        }
-
-        LinSlot slot = pendingHeaderSlot;
-        pendingHeaderValid = false;
-
-        sendHeaderRemainder(slot.frameId, slot.publisher);
-        resetInactivityTimer();
-
-        // timeout only for non-ETF unconditional frames where master is subscriber
-        if (isMaster && !slot.isETF && !isPublisherFor(slot.frameId)) {
-            pendingResponseFrameId = slot.frameId;
-
-            double tHeaderNom = headerRemainderTxTime();
-            int dlc = dlcForFrame(slot.frameId);
-            double tRespNom = responseTxTime(dlc);
-
-            double timeout =
-                1.4 * tHeaderNom +
-                interByteTime +
-                1.4 * tRespNom +
-                2.0 * propDelay;
-
-            cancelEvent(responseTimeoutTimer);
-            scheduleAt(simTime() + timeout, responseTimeoutTimer);
-        }
-
-        if (endResolveAfterHeader) {
-            EV_INFO << "Collision Resolution Complete. Returning to Normal Schedule.\n";
-            resolvingCollision = false;
-            collisionSlotIndex = 0;
-            endResolveAfterHeader = false;
-        }
-        return;
-    }
-
-    // master timeout waiting for response
-    if (msg == responseTimeoutTimer) {
-        if (pendingResponseFrameId != -1) {
-            EV_WARN << "Master TIMEOUT waiting for ID 0x" << std::hex << pendingResponseFrameId << std::dec << endl;
-            errorState.lastTimeoutError = true;
-            pendingResponseFrameId = -1;
-        }
-        return;
-    }
-
-    // any received traffic counts as activity
+    // -------------------------------------------------
+    // CHANGE #2 APPLIES HERE — AND ONLY HERE
+    // -------------------------------------------------
+    // Any received *bus traffic* counts as activity
     resetInactivityTimer();
 
-    // --- sleep state handling ---
+    // --------------------
+    // SLEEP STATE HANDLING
+    // --------------------
     if (state == SLEEP) {
         if (auto brk = dynamic_cast<LinBreakSignal*>(msg)) {
             if (isEchoFromSelf(brk->getSourceAddr())) { delete msg; return; }
@@ -401,28 +416,23 @@ void LinNode::handleMessage(cMessage *msg) {
                     if (scheduleTimer->isScheduled()) cancelEvent(scheduleTimer);
                     scheduleAt(simTime() + 0.002, scheduleTimer);
                 }
-            } else {
-                EV_DETAIL << "Ignored signal in Sleep (not a wakeup pulse).\n";
             }
-        } else {
-            EV_DETAIL << "Ignored non-break signal in Sleep.\n";
         }
         delete msg;
         return;
     }
 
+    // --------------------
     // BREAK / WAKEUP
+    // --------------------
     if (auto brk = dynamic_cast<LinBreakSignal*>(msg)) {
         if (isEchoFromSelf(brk->getSourceAddr())) { delete msg; return; }
 
         if (isWakeupPulse(brk)) {
-            EV_DETAIL << "Received Wakeup Pulse while awake. Resetting.\n";
             state = IDLE;
             resetRxContext();
         } else {
-            EV_DETAIL << "Received BREAK. Resetting state.\n";
             state = WAIT_FOR_SYNC;
-
             rxSawBreak = true;
             rxAwaitingResponse = false;
             rxExpectedResponseId = -1;
@@ -431,38 +441,28 @@ void LinNode::handleMessage(cMessage *msg) {
         return;
     }
 
+    // --------------------
     // HEADER
+    // --------------------
     if (auto header = dynamic_cast<LinHeader*>(msg)) {
         if (isEchoFromSelf(header->getSourceAddr())) { delete msg; return; }
 
         if (pendingWakeup) {
-            EV_INFO << "Wakeup Confirmed by Master Header.\n";
             pendingWakeup = false;
             wakeupRetryCount = 0;
             cancelEvent(wakeupExpirationTimer);
         }
 
-        // require BREAK before accepting a header on slaves
         if (!isMaster) {
             if (!rxSawBreak) {
-                EV_DETAIL << "Ignoring HEADER without preceding BREAK for ID 0x"
-                          << std::hex << header->getFrameId() << std::dec << endl;
                 delete msg;
                 return;
             }
             rxSawBreak = false;
         }
 
-        int expectedPid = computePID(header->getFrameId());
-        if (header->getPid() != expectedPid) {
-            EV_WARN << "Header Error! PID mismatch for ID 0x" << std::hex << header->getFrameId() << std::dec << endl;
+        if (header->getPid() != computePID(header->getFrameId())) {
             errorState.lastHeaderError = true;
-
-            if (!isMaster) {
-                rxAwaitingResponse = false;
-                rxExpectedResponseId = -1;
-            }
-
             delete msg;
             return;
         }
@@ -477,14 +477,14 @@ void LinNode::handleMessage(cMessage *msg) {
         return;
     }
 
+    // --------------------
     // RESPONSE
+    // --------------------
     if (auto rsp = dynamic_cast<LinResponse*>(msg)) {
         if (isEchoFromSelf(rsp->getSourceAddr())) { delete msg; return; }
 
         if (!isMaster) {
             if (!rxAwaitingResponse || rsp->getFrameId() != rxExpectedResponseId) {
-                EV_DETAIL << "Ignoring RESPONSE without valid matching header. Resp ID 0x"
-                          << std::hex << rsp->getFrameId() << std::dec << endl;
                 delete msg;
                 return;
             }
@@ -497,44 +497,26 @@ void LinNode::handleMessage(cMessage *msg) {
             pendingResponseFrameId = -1;
         }
 
-        int pid = computePID(rsp->getFrameId());
-        unsigned char expectedChecksum = computeChecksum(rsp, pid);
+        unsigned char expected =
+            computeChecksum(rsp, computePID(rsp->getFrameId()));
 
-        bool collision = rsp->getCollision();
-        bool checksumError = (rsp->getChecksum() != (char)expectedChecksum);
-
-        if (checksumError || collision) {
-            EV_WARN << "Response Error (Checksum/Collision) for ID 0x"
-                    << std::hex << rsp->getFrameId() << std::dec << endl;
+        if (rsp->getCollision() || rsp->getChecksum() != (char)expected) {
             errorState.lastChecksumError = true;
 
             if (isMaster && !resolvingCollision) {
-                LinSlot &currentSlot =
-                    scheduleTable[currentSlotIndex > 0 ? currentSlotIndex - 1 : scheduleTable.size() - 1];
+                LinSlot &slot =
+                    scheduleTable[currentSlotIndex > 0
+                        ? currentSlotIndex - 1
+                        : scheduleTable.size() - 1];
 
-                if (currentSlot.isETF && !collisionScheduleTable.empty()) {
-                    EV_WARN << "Collision on Event-Triggered Frame! Switching to Resolution Schedule.\n";
+                if (slot.isETF && !collisionScheduleTable.empty()) {
                     startCollisionResolution();
-                } else {
-                    EV_WARN << "Physical Error on Unconditional Frame. NOT switching schedules.\n";
                 }
             }
         } else {
-            if (isEventFrameId(rsp->getFrameId())) {
-                unsigned char innerPid = (unsigned char)rsp->getData(0);
-                int innerId = (int)(innerPid & 0x3F);
-                EV_INFO << "Received ETF RESPONSE (ETF ID 0x" << std::hex << rsp->getFrameId()
-                        << ") from UCF ID 0x" << innerId
-                        << " Byte1=" << (rsp->getDataLength() > 1 ? (unsigned int)(unsigned char)rsp->getData(1) : 0)
-                        << std::dec << endl;
-            } else {
-                EV_INFO << "Received RESPONSE ID 0x" << std::hex << rsp->getFrameId()
-                        << " Byte0=" << (rsp->getDataLength() > 0 ? (unsigned int)(unsigned char)rsp->getData(0) : 0)
-                        << std::dec << endl;
-            }
-
-            if (rsp->getFrameId() == 0x3C && rsp->getDataLength() > 0 && (unsigned char)rsp->getData(0) == 0x00) {
-                EV_WARN << "Received GO-TO-SLEEP Command.\n";
+            if (rsp->getFrameId() == 0x3C &&
+                rsp->getDataLength() > 0 &&
+                (unsigned char)rsp->getData(0) == 0x00) {
                 enterSleep("received go-to-sleep");
             }
         }
@@ -546,6 +528,7 @@ void LinNode::handleMessage(cMessage *msg) {
 
     delete msg;
 }
+
 
 // --- HELPERS ---
 bool LinNode::isWakeupPulse(LinBreakSignal *brk) {
