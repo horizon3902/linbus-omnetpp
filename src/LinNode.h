@@ -75,6 +75,7 @@ private:
     // DIAGNOSTICS (INACTIVE)
     // =========================
     LinDiagContext diagCtx;
+    int diagTargetAddress = 2;
 
     // --- TIMERS ---
     cMessage *scheduleTimer;
@@ -111,6 +112,11 @@ private:
     int wakeupRetryCount = 0;
     bool pendingWakeup = false;
 
+    // --- WAKEUP TIMING PARAMETERS (ISO 17987) ---
+    double wakeupDetectThreshold = 0.00015;  // 150 µs default
+    double masterWakeupDelay = 0.002;        // Master schedule restart delay
+    double wakeupExpiryTime = 0.150;         // Wake-up request expiry
+
     // --- PHY PARAMETERS ---
     double baudRate;
     double propDelay;
@@ -130,6 +136,7 @@ private:
     std::vector<LinSlot> collisionScheduleTable;
     bool resolvingCollision = false;
     int collisionSlotIndex = 0;
+    double collisionStartDelay = -1.0;
 
     LinSlot pendingHeaderSlot;
     bool pendingHeaderValid = false;

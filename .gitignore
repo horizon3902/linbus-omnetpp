@@ -36,6 +36,7 @@ Makefile.vc
 # compiled simulation binaries
 *_dbg
 *_rel
+linbus
 linbus_dbg
 linbus_rel
 
@@ -50,3 +51,10 @@ linbus_rel
 .cproject
 
 .env
+
+# omnetpp cmdenv log file
+.cmdenv-log
+
+*.pdf
+*.xls
+*.xlsx

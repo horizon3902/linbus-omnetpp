@@ -18,7 +18,7 @@ network LinNetwork
         master: LinNode {
             parameters:
                 isMaster = true;
-                nodeAddress = 0; // NEW
+                nodeAddress = default(0);  // NAD 0 reserved for master (overridable per .ini)
                 baudRate = 19200bps;
                 propDelay = 0.0001s;
                 interByteTime = 0.0001s;
@@ -28,7 +28,7 @@ network LinNetwork
         slaves[numSlaves]: LinNode {
             parameters:
                 isMaster = false;
-                nodeAddress = index + 1; // NEW
+                nodeAddress = default(index + 1);  // NAD 1..N for slaves (overridable per .ini)
                 baudRate = 19200bps;
                 propDelay = 0.0001s;
                 interByteTime = 0.0001s;

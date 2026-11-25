@@ -16,8 +16,7 @@ enum LinDiagRole {
 enum LinDiagTpState {
     DIAG_TP_IDLE,
     DIAG_TP_RX_IN_PROGRESS,
-    DIAG_TP_TX_IN_PROGRESS,
-    DIAG_TP_WAIT_FC
+    DIAG_TP_TX_IN_PROGRESS
 };
 
 struct LinDiagContext {
@@ -38,21 +37,10 @@ struct LinDiagContext {
     uint8_t sourceAddress = 0x00;
 
     simtime_t lastActivity;
-};
 
-
-class LinDiag {
-public:
-    LinDiag();
-
-    void init(LinDiagRole role);
-    void handleHeader(LinHeader *header);
-    LinResponse* handleResponse(LinResponse *rsp);
-
-    LinResponse* buildSlaveResponse(int sourceAddr);
-
-private:
-    LinDiagContext ctx;
+    // Spec: Slave diagnostic response is deferred until master transmits 0x3D header
+    bool pendingSlaveResponse = false;
+    LinResponse *pendingResponse = nullptr;
 };
 
 #endif

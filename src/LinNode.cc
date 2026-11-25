@@ -18,17 +18,27 @@ void LinNode::initialize() {
     if (breakBits < 1) breakBits = 13;
     if (delimiterBits < 0) delimiterBits = 1;
 
+    wakeupDetectThreshold = par("wakeupDetectThreshold").doubleValue();
+    masterWakeupDelay = par("masterWakeupDelay").doubleValue();
+    wakeupExpiryTime = par("wakeupExpiryTime").doubleValue();
+
     state = IDLE;
     scheduleRunning = true;
 
     // --------------------
     // Diagnostics (Phase 2)
     // --------------------
-    diagCtx.enabled = par("enableDiagnostics").boolValue();;
+    diagCtx.enabled = par("enableDiagnostics").boolValue();
     diagCtx.role = DIAG_NONE;
     diagCtx.tpState = DIAG_TP_IDLE;
     diagCtx.rxBuffer.clear();
     diagCtx.txBuffer.clear();
+    diagCtx.pendingSlaveResponse = false;
+    diagCtx.pendingResponse = nullptr;
+
+    if (hasPar("diagTargetAddress")) {
+        diagTargetAddress = par("diagTargetAddress").intValue();
+    }
 
     if (isMaster) {
         diagCtx.role = DIAG_MASTER;
@@ -86,6 +96,10 @@ void LinNode::initialize() {
                  parseSchedule(colConf, collisionScheduleTable);
                  EV_INFO << "Master configured with Collision Resolution Schedule.\n";
             }
+        }
+
+        if (hasPar("collisionStartDelay")) {
+            collisionStartDelay = par("collisionStartDelay").doubleValue();
         }
 
         if (!scheduleTable.empty()) {
@@ -246,6 +260,12 @@ void LinNode::enterSleep(const char *reason) {
 
     resetRxContext();
 
+    if (diagCtx.pendingResponse) {
+        delete diagCtx.pendingResponse;
+        diagCtx.pendingResponse = nullptr;
+        diagCtx.pendingSlaveResponse = false;
+    }
+
     if (isMaster) {
         scheduleRunning = false;
         cancelEvent(scheduleTimer);
@@ -377,7 +397,7 @@ void LinNode::handleMessage(cMessage *msg) {
 
             pendingWakeup = true;
             cancelEvent(wakeupExpirationTimer);
-            scheduleAt(simTime() + 0.150, wakeupExpirationTimer);
+            scheduleAt(simTime() + wakeupExpiryTime, wakeupExpirationTimer);
         }
         return;
     }
@@ -420,7 +440,7 @@ void LinNode::handleMessage(cMessage *msg) {
                 if (isMaster) {
                     scheduleRunning = true;
                     if (scheduleTimer->isScheduled()) cancelEvent(scheduleTimer);
-                    scheduleAt(simTime() + 0.002, scheduleTimer);
+                    scheduleAt(simTime() + masterWakeupDelay, scheduleTimer);
                 }
             }
         }
@@ -453,9 +473,9 @@ void LinNode::handleMessage(cMessage *msg) {
     if (auto header = dynamic_cast<LinHeader*>(msg)) {
         if (isEchoFromSelf(header->getSourceAddr())) { delete msg; return; }
         // --------------------
-        // DIAGNOSTIC HEADER INTERCEPT
+        // DIAGNOSTIC HEADER INTERCEPT (only when diagnostics enabled)
         // --------------------
-        if (isDiagnosticFrame(header->getFrameId())) {
+        if (diagCtx.enabled && isDiagnosticFrame(header->getFrameId())) {
             handleDiagnosticHeader(header);
             delete msg;
             return;
@@ -501,16 +521,33 @@ void LinNode::handleMessage(cMessage *msg) {
             computeChecksum(rsp, computePID(rsp->getFrameId()));
 
         if (rsp->getCollision() || rsp->getChecksum() != (char)expected) {
-            errorState.lastChecksumError = true;
+            bool isEtf = isEventFrameId(rsp->getFrameId());
+            if (isMaster && !resolvingCollision && !scheduleTable.empty()) {
+                int prevIdx = currentSlotIndex > 0 ? currentSlotIndex - 1 : scheduleTable.size() - 1;
+                if (prevIdx >= 0 && prevIdx < (int)scheduleTable.size()) {
+                    if (scheduleTable[prevIdx].isETF) isEtf = true;
+                }
+            }
 
-            if (isMaster && !resolvingCollision) {
-                LinSlot &slot =
-                    scheduleTable[currentSlotIndex > 0
-                        ? currentSlotIndex - 1
-                        : scheduleTable.size() - 1];
+            // ISO 17987 Clause 7.2 (Status Management):
+            // Errors on event-triggered frames (collisions) shall NOT affect response_error.
+            if (!isEtf && !rsp->getCollision()) {
+                errorState.lastChecksumError = true;
+            } else if (!isEtf && rsp->getCollision()) {
+                // Non-ETF collision (configuration fault)
+                errorState.lastChecksumError = true;
+            } else {
+                EV_INFO << "ETF collision on ID 0x" << std::hex << rsp->getFrameId()
+                        << std::dec << " - response_error NOT set (ISO 17987 status management)\n";
+            }
 
-                if (slot.isETF && !collisionScheduleTable.empty()) {
-                    startCollisionResolution();
+            if (isMaster && !resolvingCollision && !scheduleTable.empty()) {
+                int prevIdx = currentSlotIndex > 0 ? currentSlotIndex - 1 : scheduleTable.size() - 1;
+                if (prevIdx >= 0 && prevIdx < (int)scheduleTable.size()) {
+                    LinSlot &slot = scheduleTable[prevIdx];
+                    if (slot.isETF && !collisionScheduleTable.empty()) {
+                        startCollisionResolution();
+                    }
                 }
             }
 
@@ -519,9 +556,21 @@ void LinNode::handleMessage(cMessage *msg) {
         }
 
         // --------------------
-        // DIAGNOSTIC RESPONSE
+        // GO-TO-SLEEP CHECK (checked first for ID 0x3C before diagnostics)
+        // ISO 17987 / LIN 2.2A: Master Request 0x3C with Byte 0 = 0x00 and
+        // Bytes 1..7 = 0xFF is the broadcast Go-To-Sleep command.
         // --------------------
-        if (isDiagnosticFrame(rsp->getFrameId())) {
+        if (isGoToSleepCommand(rsp)) {
+            enterSleep("received go-to-sleep");
+            if (state != SLEEP) state = IDLE;
+            delete msg;
+            return;
+        }
+
+        // --------------------
+        // DIAGNOSTIC RESPONSE (only when diagnostics enabled)
+        // --------------------
+        if (diagCtx.enabled && isDiagnosticFrame(rsp->getFrameId())) {
             handleDiagnosticResponse(rsp);
             delete msg;
             return;
@@ -544,12 +593,6 @@ void LinNode::handleMessage(cMessage *msg) {
             pendingResponseFrameId = -1;
         }
 
-        if (rsp->getFrameId() == 0x3C &&
-            rsp->getDataLength() > 0 &&
-            (unsigned char)rsp->getData(0) == 0x00) {
-            enterSleep("received go-to-sleep");
-        }
-
         if (state != SLEEP) state = IDLE;
         delete msg;
         return;
@@ -569,6 +612,12 @@ bool LinNode::isDiagnosticFrame(int frameId) const {
 // --- HELPERS ---
 bool LinNode::isWakeupPulse(LinBreakSignal *brk) {
     double duration = brk->getDuration();
+    if (state == SLEEP) {
+        // ISO 17987: In SLEEP mode, any dominant pulse >= wakeupDetectThreshold (150 µs)
+        // is recognized as a valid wake-up request.
+        return (duration >= wakeupDetectThreshold);
+    }
+    // When awake (IDLE): Distinguish wake-up pulse (30 bit times) from Break signal (13-20 bit times)
     double bitTime = 1.0 / baudRate;
     return (duration > 20 * bitTime);
 }
@@ -586,8 +635,18 @@ void LinNode::startCollisionResolution() {
     resolvingCollision = true;
     collisionSlotIndex = 0;
 
-    cancelEvent(scheduleTimer);
-    scheduleAt(simTime() + 0.005, scheduleTimer);
+    if (collisionStartDelay >= 0) {
+        // Explicit delay override (e.g. for replicating historical simulation traces)
+        cancelEvent(scheduleTimer);
+        scheduleAt(simTime() + collisionStartDelay, scheduleTimer);
+    } else {
+        // ISO 17987: Collision resolving schedule table is activated after the frame
+        // slot where the collision occurred. scheduleTimer is already scheduled for
+        // the end of the current slot, so it will fire at the next slot boundary.
+        if (!scheduleTimer->isScheduled()) {
+            scheduleAt(simTime(), scheduleTimer);
+        }
+    }
 }
 
 void LinNode::parseSchedule(const char* config, std::vector<LinSlot>& table) {
@@ -693,11 +752,19 @@ void LinNode::sendHeaderRemainder(int frameId, std::string publisher)
         rsp->setIngressPortIndex(-1);
         rsp->setFrameId(LIN_DIAG_MASTER_REQUEST_ID);
 
-        // ---- Single Frame diagnostic request ----
-        rsp->setDataLength(3);
-        rsp->setData(0, 0x02);                 // SF, length = 2
-        rsp->setData(1, LIN_DIAG_NAD_BROADCAST); // NAD
-        rsp->setData(2, 0x10);                 // SID: Diagnostic Session Control
+        // ---- Single Frame diagnostic request (ISO 17987-2 / LIN 2.2A) ----
+        // Diagnostic frames are always 8 bytes:
+        // Byte 0: NAD (Node Address for Diagnostic)
+        // Byte 1: PCI (Protocol Control Info: high nibble=SF(0), low nibble=length(2))
+        // Byte 2: SID (Service Identifier: 0x10 Diagnostic Session Control)
+        // Bytes 3..7: Padded with 0xFF
+        rsp->setDataLength(8);
+        rsp->setData(0, (uint8_t)diagTargetAddress); // Byte 0: NAD
+        rsp->setData(1, 0x02);                       // Byte 1: PCI (SF, length = 2)
+        rsp->setData(2, 0x10);                       // Byte 2: SID (0x10)
+        for (int i = 3; i < 8; i++) {
+            rsp->setData(i, (char)0xFF);
+        }
 
         rsp->setChecksum(
             computeChecksum(rsp, computePID(LIN_DIAG_MASTER_REQUEST_ID))
@@ -774,8 +841,24 @@ void LinNode::handleDiagnosticHeader(LinHeader *header)
     if (frameId == LIN_DIAG_SLAVE_RESPONSE_ID) {
         if (isMaster) {
             EV_INFO << "[DIAG] Master awaiting diagnostic response payload\n";
+            return;
+        } else {
+            // ISO 17987 / LIN 2.2A: Slave transmits its pending diagnostic response
+            // ONLY after receiving the Master's 0x3D header
+            if (diagCtx.pendingSlaveResponse && diagCtx.pendingResponse) {
+                EV_INFO << "[DIAG] Slave transmitting pending diagnostic RESPONSE (0x3D)\n";
+                sendDelayed(diagCtx.pendingResponse, interByteTime, "gate$o");
+                state = TRANSMITTING;
+                diagCtx.pendingResponse = nullptr;
+                diagCtx.pendingSlaveResponse = false;
+                diagCtx.tpState = DIAG_TP_IDLE;
+                return;
+            } else {
+                EV_INFO << "[DIAG] Slave received 0x3D header with no response pending\n";
+                state = RECEIVING;
+                return;
+            }
         }
-        return;
     }
 
     EV_WARN << "[DIAG] Unknown diagnostic frame ID\n";
@@ -812,7 +895,14 @@ void LinNode::handleDiagnosticResponse(LinResponse *rsp)
         return;
     }
 
-    uint8_t pci = (uint8_t)rsp->getData(0);
+    // ISO 17987-2 / LIN 2.2A Transport Layer Single Frame:
+    // Byte 0: NAD
+    // Byte 1: PCI (high nibble = frame type, low nibble = length)
+    // Byte 2: SID
+    uint8_t nad = (uint8_t)rsp->getData(0);
+    uint8_t pci = (uint8_t)rsp->getData(1);
+    uint8_t sid = (uint8_t)rsp->getData(2);
+
     uint8_t frameType = (pci >> 4) & 0x0F;
 
     // ----------------------------------------
@@ -833,9 +923,6 @@ void LinNode::handleDiagnosticResponse(LinResponse *rsp)
         state = IDLE;
         return;
     }
-
-    uint8_t nad = (uint8_t)rsp->getData(1);
-    uint8_t sid = (uint8_t)rsp->getData(2);
 
     EV_INFO << "[DIAG] Diagnostic REQUEST received: NAD=0x"
             << std::hex << (int)nad
@@ -864,7 +951,7 @@ void LinNode::handleDiagnosticResponse(LinResponse *rsp)
 
 
     // ----------------------------------------
-    // Build SLAVE RESPONSE (0x3D)
+    // Build SLAVE RESPONSE (0x3D) - Defer until 0x3D header
     // ----------------------------------------
     diagCtx.tpState = DIAG_TP_TX_IN_PROGRESS;
     LinResponse *resp = new LinResponse("LIN_DiagSlaveResponse");
@@ -872,23 +959,34 @@ void LinNode::handleDiagnosticResponse(LinResponse *rsp)
     resp->setIngressPortIndex(-1);
     resp->setFrameId(LIN_DIAG_SLAVE_RESPONSE_ID);
 
-    // Single Frame response: PCI + NAD + SID(+0x40)
-    resp->setDataLength(3);
-    resp->setData(0, 0x02);          // SF, length=2
-    resp->setData(1, nad);           // Echo NAD
-    resp->setData(2, sid + 0x40);    // Positive response SID
+    // Single Frame response (ISO 17987-2 / LIN 2.2A):
+    // Always 8 bytes:
+    // Byte 0: NAD (echo received NAD)
+    // Byte 1: PCI (0x02: SF, length=2)
+    // Byte 2: Positive response SID (SID + 0x40)
+    // Bytes 3..7: Padded with 0xFF
+    resp->setDataLength(8);
+    resp->setData(0, nad);           // Byte 0: NAD
+    resp->setData(1, 0x02);          // Byte 1: PCI (SF, length=2)
+    resp->setData(2, sid + 0x40);    // Byte 2: Positive response SID
+    for (int i = 3; i < 8; i++) {
+        resp->setData(i, (char)0xFF);
+    }
 
     resp->setChecksum(
         computeChecksum(resp, computePID(LIN_DIAG_SLAVE_RESPONSE_ID))
     );
 
-    EV_INFO << "[DIAG] Slave sending diagnostic RESPONSE (0x3D)\n";
+    // ISO 17987: Slave must NOT transmit immediately; store response
+    // and wait for Master to issue the 0x3D (SlaveResp) header.
+    if (diagCtx.pendingResponse) {
+        delete diagCtx.pendingResponse;
+    }
+    diagCtx.pendingResponse = resp;
+    diagCtx.pendingSlaveResponse = true;
 
-    sendDelayed(resp, interByteTime, "gate$o");
-    state = TRANSMITTING;
-
-    // TX is now scheduled; TP transaction complete for SF
-    diagCtx.tpState = DIAG_TP_IDLE;
+    EV_INFO << "[DIAG] Slave prepared diagnostic RESPONSE (0x3D), pending 0x3D header\n";
+    state = IDLE;
 }
 
 
@@ -994,4 +1092,9 @@ void LinNode::finish() {
     cancelAndDelete(goToSleepTimer);
     cancelAndDelete(eventRearmTimer);
     cancelAndDelete(inactivityTimer);
+
+    if (diagCtx.pendingResponse) {
+        delete diagCtx.pendingResponse;
+        diagCtx.pendingResponse = nullptr;
+    }
 }
